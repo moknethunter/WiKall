@@ -1,0 +1,48 @@
+name: Build WiKall APK
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  android:
+    name: Test and assemble debug APK
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+
+    steps:
+      - name: Check out the repository
+        uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - name: Set up JDK 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      - name: Make Android SDK 35 available
+        shell: bash
+        run: |
+          sdk="${ANDROID_HOME:?Android SDK is unavailable on this runner}"
+          if [[ ! -f "$sdk/platforms/android-35/android.jar" || ! -x "$sdk/build-tools/35.0.0/aapt2" ]]; then
+            "$sdk/cmdline-tools/latest/bin/sdkmanager" --sdk_root="$sdk" "platforms;android-35" "build-tools;35.0.0"
+          fi
+
+      - name: Run JVM tests and build APK
+        run: ./gradlew --no-daemon test assembleDebug
+
+      - name: Upload the signed debug APK
+        uses: actions/upload-artifact@v4
+        with:
+          name: WiKall-Debug
+          path: build/outputs/apk/WiKall-Debug.apk
+          if-no-files-found: error
+          retention-days: 14
