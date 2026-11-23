@@ -37,7 +37,7 @@ jobs:
           fi
 
       - name: Run JVM tests and build APK
-        run: ./gradlew --no-daemon test assembleDebug
+        run: env -u GRADLE_HOME ./gradlew --no-daemon test assembleDebug
 
       - name: Upload the signed debug APK
         uses: actions/upload-artifact@v4
