@@ -10,6 +10,7 @@ import java.util.UUID
 import java.util.concurrent.CountDownLatch
 import java.util.concurrent.TimeUnit
 import java.util.concurrent.atomic.AtomicBoolean
+import java.util.concurrent.atomic.AtomicReference
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertNotNull
 import org.junit.Assert.assertTrue
@@ -40,10 +41,16 @@ class AndroidActivationTest {
         val otherKey = KeyPairGenerator.getInstance("RSA").apply { initialize(2048) }.generateKeyPair()
         assertTrue(runCatching { Activation.read(bytes, otherKey.private, request.serial) }.isFailure)
 
-        LocalHost(server.tls(), lan, 0, store, issued.pin).use { host ->
+        val handshakeFailure = AtomicReference<Throwable>()
+        LocalHost(server.tls(), lan, 0, store, issued.pin) { handshakeFailure.compareAndSet(null, it) }.use { host ->
             host.serve({ _, _ -> }, { _, _ -> }, {})
             LocalClient(lan, unlocked.pin, host.localPort).use { client ->
-                client.connect(unlocked, device.signing)
+                try {
+                    client.connect(unlocked, device.signing)
+                } catch (error: java.io.IOException) {
+                    handshakeFailure.get()?.let(error::addSuppressed)
+                    throw error
+                }
                 val id = UUID.randomUUID()
                 client.send(Signal(SignalType.PING, id))
                 assertEquals(Signal(SignalType.PONG, id), client.receive())
