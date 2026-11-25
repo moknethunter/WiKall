@@ -21,7 +21,6 @@ import java.util.concurrent.Semaphore
 import java.util.concurrent.TimeUnit
 import java.util.concurrent.atomic.AtomicBoolean
 import javax.net.ssl.SSLContext
-import kotlin.time.Duration.Companion.seconds
 import kotlinx.coroutines.cancel
 import kotlinx.coroutines.channels.Channel
 import kotlinx.coroutines.coroutineScope
@@ -141,8 +140,8 @@ internal class LocalHost(
     }) {
         install(WebSockets) {
             maxFrameSize = MAX_SIGNAL_SIZE.toLong()
-            pingPeriod = 12.seconds
-            timeout = 20.seconds
+            pingPeriodMillis = 12_000
+            timeoutMillis = 20_000
         }
         routing {
             webSocket(SIGNAL_PATH) {
