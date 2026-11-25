@@ -10,7 +10,10 @@ import io.ktor.server.websocket.webSocket
 import io.ktor.websocket.Frame
 import io.ktor.websocket.WebSocketSession
 import io.ktor.websocket.readText
+import io.netty.channel.ChannelHandlerContext
+import io.netty.channel.ChannelInboundHandlerAdapter
 import io.netty.handler.ssl.SslHandler
+import io.netty.handler.ssl.SslHandshakeCompletionEvent
 import java.io.IOException
 import java.net.Proxy
 import java.security.PrivateKey
@@ -87,6 +90,7 @@ internal class LocalHost(
     listenPort: Int = PORT,
     private val registry: EnrollmentRegistry,
     private val serverPin: String,
+    private val onHandshakeFailure: ((Throwable) -> Unit)? = null,
 ) : AutoCloseable {
     private class Peer(private val session: WebSocketSession) : SignalChannel {
         val outbound = Channel<Signal>(capacity = 48)
@@ -126,9 +130,29 @@ internal class LocalHost(
         channelPipelineConfig = {
             val engine = context.createSSLEngine().apply {
                 useClientMode = false
-                enabledProtocols = supportedProtocols.filter { it == "TLSv1.3" || it == "TLSv1.2" }.toTypedArray()
+                // Android 10's JSSE engine and non-exportable RSA server keys can fail TLS 1.3.
+                // Keep a modern, pinned TLS 1.2 connection for that platform.
+                val tls13 = context.provider.name != "AndroidOpenSSL" || android.os.Build.VERSION.SDK_INT > 29
+                enabledProtocols = supportedProtocols.filter { it == "TLSv1.2" || tls13 && it == "TLSv1.3" }.toTypedArray()
+                enabledCipherSuites = enabledCipherSuites.filter { suite ->
+                    suite.startsWith("TLS_AES_") || suite == "TLS_CHACHA20_POLY1305_SHA256" ||
+                        suite.startsWith("TLS_ECDHE_RSA_WITH_AES_") && "_GCM_" in suite
+                }.toTypedArray()
             }
             addFirst("wi-call-tls", SslHandler(engine).apply { handshakeTimeoutMillis = 5_000 })
+            onHandshakeFailure?.let { report ->
+                addAfter("wi-call-tls", "wi-call-handshake-report", object : ChannelInboundHandlerAdapter() {
+                    override fun userEventTriggered(ctx: ChannelHandlerContext, event: Any) {
+                        if (event is SslHandshakeCompletionEvent && !event.isSuccess) event.cause()?.let(report)
+                        super.userEventTriggered(ctx, event)
+                    }
+
+                    override fun exceptionCaught(ctx: ChannelHandlerContext, cause: Throwable) {
+                        report(cause)
+                        super.exceptionCaught(ctx, cause)
+                    }
+                })
+            }
         }
     }) {
         install(WebSockets) {
