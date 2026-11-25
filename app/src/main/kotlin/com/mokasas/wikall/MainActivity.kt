@@ -53,6 +53,7 @@ import androidx.compose.runtime.setValue
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.platform.LocalLayoutDirection
+import androidx.compose.ui.platform.testTag
 import androidx.compose.ui.text.TextStyle
 import androidx.compose.ui.text.style.TextDirection
 import androidx.compose.ui.unit.LayoutDirection
@@ -473,7 +474,7 @@ class MainActivity : ComponentActivity() {
                                 row.forEach { digit ->
                                     OutlinedButton(
                                         onClick = { if (digits.length < 5) digits += digit },
-                                        modifier = Modifier.weight(1f).heightIn(min = 48.dp),
+                                        modifier = Modifier.weight(1f).heightIn(min = 48.dp).testTag("dial-digit-$digit"),
                                     ) { Text(digit.toString()) }
                                 }
                             }
@@ -484,7 +485,7 @@ class MainActivity : ComponentActivity() {
                         ) {
                             OutlinedButton(
                                 onClick = { if (digits.length < 5) digits += '0' },
-                                modifier = Modifier.weight(1f).heightIn(min = 48.dp),
+                                modifier = Modifier.weight(1f).heightIn(min = 48.dp).testTag("dial-digit-0"),
                             ) { Text("0") }
                             OutlinedButton(
                                 onClick = { digits = digits.dropLast(1) },

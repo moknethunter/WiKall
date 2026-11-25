@@ -9,6 +9,7 @@ import androidx.test.platform.app.InstrumentationRegistry
 import androidx.compose.ui.test.assertIsDisplayed
 import androidx.compose.ui.test.junit4.createAndroidComposeRule
 import androidx.compose.ui.test.onNodeWithText
+import androidx.compose.ui.test.onNodeWithTag
 import androidx.compose.ui.test.performClick
 import androidx.compose.ui.test.performScrollTo
 import java.io.File
@@ -60,7 +61,7 @@ class AndroidScreensTest {
                 app.onAllNodes(androidx.compose.ui.test.hasText("شاشة الاتصال")).fetchSemanticsNodes().isNotEmpty()
             }
             app.onNodeWithText("شاشة الاتصال").performClick()
-            "99001".forEach { digit -> app.onNodeWithText(digit.toString()).performClick() }
+            "99001".forEach { digit -> app.onNodeWithTag("dial-digit-$digit").performClick() }
             app.onNodeWithText("99001").assertIsDisplayed()
             app.onNodeWithText("اتصل").performClick()
             app.waitUntil(10_000) {
