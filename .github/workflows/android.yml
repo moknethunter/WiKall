@@ -36,9 +36,6 @@ jobs:
             "$sdk/cmdline-tools/latest/bin/sdkmanager" --sdk_root="$sdk" "platforms;android-35" "build-tools;35.0.0"
           fi
 
-      - name: Verify JVM contracts and run Android lint
-        run: env -u GRADLE_HOME ./gradlew --no-daemon :app:testDebugUnitTest :app:lintDebug
-
       - name: Enable Android emulator acceleration
         shell: bash
         run: |
@@ -46,14 +43,14 @@ jobs:
           sudo udevadm control --reload-rules
           sudo udevadm trigger --name-match=kvm
 
-      - name: Verify Android 10 activation and local audio negotiation
+      - name: Verify JVM contracts, Android lint, and Android 10 behavior
         uses: reactivecircus/android-emulator-runner@v2
         with:
           api-level: 29
           target: google_apis
           arch: x86_64
           disable-animations: true
-          script: env -u GRADLE_HOME ./gradlew --no-daemon :app:connectedDebugAndroidTest
+          script: env -u GRADLE_HOME ./gradlew --no-daemon :app:testDebugUnitTest :app:lintDebug :app:connectedDebugAndroidTest
 
       - name: Assemble the verified APK
         run: env -u GRADLE_HOME ./gradlew --no-daemon :assembleDebug
