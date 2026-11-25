@@ -21,6 +21,14 @@ class ContractTest {
     }
     private val entry = store.getEntry("fixture", KeyStore.PasswordProtection(password)) as KeyStore.PrivateKeyEntry
 
+    @Test fun movingNetworksTriesDiscoveredAndGatewayAddressesBeforeStaleHints() {
+        assertEquals(listOf("192.168.43.8", "192.168.43.1", "192.168.1.5", "192.168.1.8"),
+            lanCandidates("192.168.43.8", listOf("192.168.43.1", "8.8.8.8", "192.168.43.8"),
+                "192.168.1.5", "192.168.1.8"))
+        assertEquals(listOf("192.168.43.1", "192.168.1.5"),
+            lanCandidates(null, listOf("192.168.43.1"), "192.168.1.5", "192.168.1.5"))
+    }
+
     @Test fun encryptedActivationIsRestrictedToItsDevice() {
         val request = DeviceRequest(first.public, second.public)
         val submitted = DeviceRequest.read(request.export(first.private))

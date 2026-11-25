@@ -185,14 +185,15 @@ internal class ConnectionController @Inject constructor(
             val current = generation
             discovery.find(saved.pin) { address ->
                 if (current == generation) {
-                    val discovered = address?.takeIf { it != saved.address }
-                    open(saved.copy(address = discovered ?: saved.address), saved.takeIf { discovered != null })
+                    val gateways = runCatching(::lanGateways).getOrDefault(emptyList())
+                    val candidates = lanCandidates(address, gateways, saved.address, saved.activation.address)
+                    open(saved.copy(address = candidates.first()), candidates.drop(1))
                 }
             }
         }
     }
 
-    private fun open(saved: SavedConnection, fallback: SavedConnection? = null) {
+    private fun open(saved: SavedConnection, fallback: List<String> = emptyList()) {
         val current = generation
         publish(state.value.copy(busy = true, address = saved.address, status = "جارٍ التحقق من هوية الخادم…"))
         worker.execute {
@@ -205,7 +206,11 @@ internal class ConnectionController @Inject constructor(
                 require(trusted == null || Wire.equal(trusted.pin, saved.pin)) {
                     "هذا الهاتف موثّق بخادم آخر. انس التفعيل المحفوظ قبل الانتقال إلى خادم جديد."
                 }
-                endpoint = LocalClient(saved.address, saved.pin, localNetwork = lanSocketFactory(saved.address))
+                endpoint = try {
+                    LocalClient(saved.address, saved.pin, localNetwork = lanSocketFactory(saved.address))
+                } catch (failure: java.io.IOException) {
+                    throw EndpointUnavailable("تعذّر فتح اتصال على الشبكة الحالية.", failure)
+                }
                 val candidate = endpoint
                 main.post {
                     if (current == generation) client = candidate else candidate.close()
@@ -243,12 +248,18 @@ internal class ConnectionController @Inject constructor(
                 }
             } catch (failure: Exception) {
                 onMain(current) {
-                    if (!online && fallback != null) {
-                        open(fallback)
+                    val addressFailure = failure is EndpointUnavailable
+                    if (!online && addressFailure && fallback.isNotEmpty()) {
+                        open(saved.copy(address = fallback.first()), fallback.drop(1))
                         return@onMain
                     }
-                    disconnect(if (online) "انقطع اتصال الخادم." else failure.message.orEmpty().ifBlank { "تعذّر الاتصال المحلي." })
-                    if ((online || retryCount > 0) && retryCount < RETRY_DELAYS.size) {
+                    val reason = when {
+                        online -> "انقطع اتصال الخادم."
+                        addressFailure -> "تعذّر العثور على الخادم بهذا العنوان. شغّله على الشبكة الحالية أو أدخل عنوانه عبر «تغيير عنوان الخادم». التفعيل محفوظ إن سبق استخدامه."
+                        else -> failure.message.orEmpty().ifBlank { "تعذّر الاتصال المحلي." }
+                    }
+                    disconnect(reason)
+                    if ((online || addressFailure && retryCount > 0) && retryCount < RETRY_DELAYS.size) {
                         val delay = RETRY_DELAYS[retryCount++]
                         retry = Runnable { locate(saved, false) }.also { main.postDelayed(it, delay) }
                     }
@@ -348,14 +359,24 @@ internal class ConnectionController @Inject constructor(
         if (state.value.peer == number) received(message)
     }
 
-    private fun lanSocketFactory(address: String): javax.net.SocketFactory? {
+    private fun lanNetworks(): List<Pair<android.net.Network, android.net.LinkProperties>> {
         val manager = context.getSystemService(ConnectivityManager::class.java)
-        val target = InetAddress.getByName(address)
-        return manager.allNetworks.firstOrNull { network ->
-            val capabilities = manager.getNetworkCapabilities(network) ?: return@firstOrNull false
+        return manager.allNetworks.mapNotNull { network ->
+            val capabilities = manager.getNetworkCapabilities(network) ?: return@mapNotNull null
             if (!capabilities.hasTransport(NetworkCapabilities.TRANSPORT_WIFI) &&
-                !capabilities.hasTransport(NetworkCapabilities.TRANSPORT_ETHERNET)) return@firstOrNull false
-            manager.getLinkProperties(network)?.linkAddresses?.any { link ->
+                !capabilities.hasTransport(NetworkCapabilities.TRANSPORT_ETHERNET)) return@mapNotNull null
+            manager.getLinkProperties(network)?.let { network to it }
+        }
+    }
+
+    private fun lanGateways(): List<String> = lanNetworks().flatMap { (_, link) ->
+        link.routes.filter { it.isDefaultRoute }.mapNotNull { it.gateway?.hostAddress }
+    }
+
+    private fun lanSocketFactory(address: String): javax.net.SocketFactory? {
+        val target = InetAddress.getByName(address)
+        return lanNetworks().firstOrNull { (_, properties) ->
+            properties.linkAddresses.any { link ->
                 val local = link.address.address
                 val remote = target.address
                 local.size == remote.size && local.indices.all { index ->
@@ -363,8 +384,8 @@ internal class ConnectionController @Inject constructor(
                     val mask = (0xff shl (8 - bits)) and 0xff
                     ((local[index].toInt() xor remote[index].toInt()) and mask) == 0
                 }
-            } == true
-        }?.socketFactory
+            }
+        }?.first?.socketFactory
     }
 
     private fun received(message: Signal) {

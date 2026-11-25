@@ -54,7 +54,14 @@ internal class VoiceMedia(
             .setUseHardwareNoiseSuppressor(true)
             .createAudioDeviceModule()
         val engine = try {
-            PeerConnectionFactory.builder().setAudioDeviceModule(device).createPeerConnectionFactory()
+            val options = PeerConnectionFactory.Options().apply {
+                // Android's network monitor can omit the downstream interface of a phone hotspot.
+                // Enumerate interfaces directly for local ICE, which still publishes only private IPv4.
+                disableNetworkMonitor = true
+                networkIgnoreMask = PeerConnectionFactory.Options.ADAPTER_TYPE_CELLULAR or
+                    PeerConnectionFactory.Options.ADAPTER_TYPE_VPN or PeerConnectionFactory.Options.ADAPTER_TYPE_LOOPBACK
+            }
+            PeerConnectionFactory.builder().setOptions(options).setAudioDeviceModule(device).createPeerConnectionFactory()
         } finally {
             device.release()
         }
@@ -142,12 +149,12 @@ internal class VoiceMedia(
 
     private val observer = object : PeerConnection.Observer {
         override fun onSignalingChange(state: PeerConnection.SignalingState?) = Unit
-        override fun onIceConnectionChange(state: PeerConnection.IceConnectionState?) = active {
+        override fun onIceConnectionChange(state: PeerConnection.IceConnectionState?) = Unit
+        override fun onConnectionChange(state: PeerConnection.PeerConnectionState?) = active {
             when (state) {
-                PeerConnection.IceConnectionState.CONNECTED, PeerConnection.IceConnectionState.COMPLETED ->
-                    onState(CallState.CONNECTED)
-                PeerConnection.IceConnectionState.DISCONNECTED -> onState(CallState.RECONNECTING)
-                PeerConnection.IceConnectionState.FAILED -> onFailure()
+                PeerConnection.PeerConnectionState.CONNECTED -> onState(CallState.CONNECTED)
+                PeerConnection.PeerConnectionState.DISCONNECTED -> onState(CallState.RECONNECTING)
+                PeerConnection.PeerConnectionState.FAILED -> onFailure()
                 else -> Unit
             }
         }

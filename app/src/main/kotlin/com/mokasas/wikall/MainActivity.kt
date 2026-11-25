@@ -309,7 +309,7 @@ class MainActivity : ComponentActivity() {
                                     runSession { controller.connect(current.license, current.bytes) }
                                 }
                             } ?: Action("الاتصال بالتفعيل المحفوظ") { runSession { controller.reconnect() } }
-                            Action("عنوان IP يدوي", true) {
+                            Action("تغيير عنوان الخادم", true) {
                                 addressInput = imported?.license?.address ?: session.address.orEmpty()
                                 manualAction = { address ->
                                     val file = imported

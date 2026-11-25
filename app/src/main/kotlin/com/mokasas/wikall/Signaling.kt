@@ -298,6 +298,8 @@ internal class LocalHost(
     }
 }
 
+internal class EndpointUnavailable(message: String, cause: Throwable) : IOException(message, cause)
+
 internal class LocalClient(
     private val host: String,
     pin: String,
@@ -339,7 +341,8 @@ internal class LocalClient(
                 error is SSLException -> "تعذّر التحقق من هوية الخادم. استخدم ملف تفعيل صادرًا من هذا الخادم."
                 else -> "تعذّر الوصول إلى $host. تحقق من تشغيل الخادم وإمكانية الوصول بين الهاتفين."
             }
-            throw IOException(status, error)
+            if (handshaken) throw IOException(status, error)
+            throw EndpointUnavailable(status, error)
         }
     }
 
