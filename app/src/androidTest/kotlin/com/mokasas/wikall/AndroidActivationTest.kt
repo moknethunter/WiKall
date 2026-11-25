@@ -19,7 +19,7 @@ import org.junit.runner.RunWith
 
 @RunWith(AndroidJUnit4::class)
 class AndroidActivationTest {
-    @Test fun androidKeystoreStoresDeviceIdentityAndAuthenticatesAWebSocket() {
+    @Test fun androidKeystoreStoresDeviceIdentityAndAuthenticatesATlsSocket() {
         val server = ServerIdentity.load()
         val device = DeviceIdentity.load()
         val request = DeviceRequest.read(device.request.export(device.signing))
