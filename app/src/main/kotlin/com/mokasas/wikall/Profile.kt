@@ -16,17 +16,23 @@ internal object Wire {
     fun pin(key: PublicKey): String = MessageDigest.getInstance("SHA-256")
         .digest(key.encoded).joinToString("") { "%02X".format(it.toInt() and 255) }
     fun equal(a: String, b: String): Boolean = MessageDigest.isEqual(a.toByteArray(), b.toByteArray())
-    fun signature(key: PrivateKey, body: ByteArray): ByteArray = Signature.getInstance("SHA256withRSA").run {
+    fun signature(key: PrivateKey, body: ByteArray): ByteArray = Signature.getInstance(signatureAlgorithm(key.algorithm)).run {
         initSign(key)
         update(body)
         sign()
     }
     fun verified(key: PublicKey, body: ByteArray, signature: ByteArray): Boolean =
-        Signature.getInstance("SHA256withRSA").run {
+        Signature.getInstance(signatureAlgorithm(key.algorithm)).run {
             initVerify(key)
             update(body)
             verify(signature)
         }
+
+    private fun signatureAlgorithm(key: String) = when (key) {
+        "RSA" -> "SHA256withRSA"
+        "EC" -> "SHA256withECDSA"
+        else -> throw IllegalArgumentException("Unsupported signing key")
+    }
 }
 
 internal fun privateIpv4(address: String): Boolean {
