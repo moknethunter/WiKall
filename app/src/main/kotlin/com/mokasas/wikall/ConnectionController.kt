@@ -38,7 +38,7 @@ internal class ConnectionController @Inject constructor(
     private val worker = Executors.newCachedThreadPool()
     private val sender = Executors.newSingleThreadExecutor()
     private val discovery = LanDiscovery(context)
-    private var generation = 0
+    @Volatile private var generation = 0
     private var host: LocalHost? = null
     private var client: LocalClient? = null
     private var channel: SignalChannel? = null
@@ -160,12 +160,15 @@ internal class ConnectionController @Inject constructor(
         else {
             val current = generation
             discovery.find(saved.pin) { address ->
-                if (current == generation) open(saved.copy(address = address ?: saved.address), token)
+                if (current == generation) {
+                    val discovered = address?.takeIf { it != saved.address }
+                    open(saved.copy(address = discovered ?: saved.address), token, saved.takeIf { discovered != null })
+                }
             }
         }
     }
 
-    private fun open(saved: SavedConnection, token: String?) {
+    private fun open(saved: SavedConnection, token: String?, fallback: SavedConnection? = null) {
         val current = generation
         publish(state.value.copy(busy = true, address = saved.address, status = "جارٍ التحقق من هوية الخادم…"))
         worker.execute {
@@ -178,16 +181,23 @@ internal class ConnectionController @Inject constructor(
                     if (current == generation) client = candidate else candidate.close()
                 }
                 val active = endpoint.connect(token, saved.credential)
-                // Persist only after the pinned server accepts this device.
-                val savedOk = runCatching { store.save(saved) }.isSuccess
                 online = true
                 onMain(current) {
                     retryCount = 0
                     channel = active
                     publish(state.value.copy(
                         peer = "1000", busy = false,
-                        status = if (savedOk) "متصل بالخادم المحلي." else "متصل. تعذّر حفظ الاقتران على الهاتف.",
+                        status = "متصل بالخادم المحلي.",
                     ))
+                    sender.execute {
+                        if (current == generation && runCatching { store.save(saved) }.isFailure) {
+                            onMain(current) {
+                                if (channel === active) publish(
+                                    state.value.copy(status = "متصل. تعذّر حفظ الاقتران على الهاتف.")
+                                )
+                            }
+                        }
+                    }
                     probe()
                     heartbeat = object : Runnable {
                         override fun run() {
@@ -204,6 +214,10 @@ internal class ConnectionController @Inject constructor(
             } catch (_: Exception) {
                 val retryConnection = token == null || online
                 onMain(current) {
+                    if (!online && fallback != null) {
+                        open(fallback, token)
+                        return@onMain
+                    }
                     disconnect(if (online) "انقطع اتصال الخادم." else "تعذّر الاتصال. تحقق من الشبكة والاقتران.")
                     if (retryConnection && retryCount < RETRY_DELAYS.size) {
                         val delay = RETRY_DELAYS[retryCount++]

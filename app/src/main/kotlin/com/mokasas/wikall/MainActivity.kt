@@ -8,6 +8,7 @@ import android.net.Uri
 import android.os.Build
 import android.os.Bundle
 import androidx.activity.ComponentActivity
+import androidx.activity.enableEdgeToEdge
 import androidx.activity.compose.BackHandler
 import androidx.activity.compose.setContent
 import androidx.activity.result.contract.ActivityResultContracts
@@ -91,6 +92,7 @@ class MainActivity : ComponentActivity() {
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
+        enableEdgeToEdge()
         selectedMode = savedInstanceState?.getString("mode")?.let(Mode::valueOf) ?: Mode.HOME
         setContent {
             CompositionLocalProvider(LocalLayoutDirection provides LayoutDirection.Rtl) {
@@ -99,6 +101,9 @@ class MainActivity : ComponentActivity() {
                     background = Color(0xFF101820), surface = Color(0xFF1C2B35),
                 )) {
                     val session by controller.state.collectAsState()
+                    LaunchedEffect(session.peer, session.mode) {
+                        if (session.mode == Mode.CLIENT && session.peer != null) imported = null
+                    }
                     LaunchedEffect(session.callId, session.callState, resumed) {
                         val incoming = session.callState == CallState.RINGING
                         setShowWhenLocked(incoming || session.callId != null)
