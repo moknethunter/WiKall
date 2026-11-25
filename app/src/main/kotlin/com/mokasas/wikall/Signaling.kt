@@ -1,6 +1,7 @@
 package com.mokasas.wikall
 
 import java.io.DataInputStream
+import java.security.MessageDigest
 import java.io.DataOutputStream
 import java.net.InetSocketAddress
 import java.net.SocketTimeoutException
@@ -11,8 +12,10 @@ import javax.net.ssl.SSLServerSocket
 import javax.net.ssl.SSLSocket
 import kotlin.concurrent.thread
 
-internal enum class SignalType { PAIR, READY, PING, PONG, INVITE, ACCEPT, REJECT, BUSY, TIMEOUT, END }
-internal data class Signal(val type: SignalType, val id: UUID, val token: String? = null)
+internal enum class SignalType {
+    PAIR, REJOIN, READY, PING, PONG, INVITE, ACCEPT, REJECT, BUSY, TIMEOUT, END, OFFER, ANSWER, ICE
+}
+internal data class Signal(val type: SignalType, val id: UUID, val payload: String? = null)
 internal val probeId: UUID = UUID(0, 0)
 
 internal class SignalChannel(private val socket: SSLSocket) : AutoCloseable {
@@ -21,9 +24,10 @@ internal class SignalChannel(private val socket: SSLSocket) : AutoCloseable {
     private val writeLock = Any()
 
     fun send(signal: Signal) = synchronized(writeLock) {
-        val text = "1|${signal.type.name}|${signal.id}|${signal.token.orEmpty()}"
+        val payload = signal.payload?.let { Wire.encode(it.encodeToByteArray()) }.orEmpty()
+        val text = "2|${signal.type.name}|${signal.id}|$payload"
         val bytes = text.toByteArray()
-        require(bytes.size <= 256)
+        require(bytes.size <= MAX_SIGNAL_SIZE)
         output.writeShort(bytes.size)
         output.write(bytes)
         output.flush()
@@ -31,27 +35,54 @@ internal class SignalChannel(private val socket: SSLSocket) : AutoCloseable {
 
     fun receive(): Signal {
         val size = input.readUnsignedShort()
-        require(size in 1..256)
+        require(size in 1..MAX_SIGNAL_SIZE)
         val bytes = ByteArray(size)
         input.readFully(bytes)
         val parts = bytes.decodeToString(throwOnInvalidSequence = true).split('|')
-        require(parts.size == 4 && parts[0] == "1")
+        require(parts.size == 4 && parts[0] == "2")
         val type = SignalType.valueOf(parts[1])
         val id = UUID.fromString(parts[2])
         require(id.toString() == parts[2])
-        val token = parts[3].ifEmpty { null }
-        if (type == SignalType.PAIR) {
-            require(id == probeId && token != null && Wire.decode(token).size == 24)
-        } else {
-            require(token == null)
+        val payload = parts[3].takeIf { it.isNotEmpty() }
+            ?.let { Wire.decode(it).decodeToString(throwOnInvalidSequence = true) }
+        when (type) {
+            SignalType.PAIR -> {
+                require(id == probeId)
+                val credentials = requireNotNull(payload).split('.')
+                require(credentials.size == 2 && credentials.all(::validCredential))
+            }
+            SignalType.REJOIN -> require(id == probeId && payload != null && validCredential(payload))
+            SignalType.OFFER, SignalType.ANSWER, SignalType.ICE -> require(id != probeId && payload != null)
+            else -> require(payload == null)
         }
-        return Signal(type, id, token)
+        return Signal(type, id, payload)
+    }
+
+    private companion object {
+        const val MAX_SIGNAL_SIZE = 16 * 1024
     }
 
     override fun close() = socket.close()
 }
 
-internal class LocalHost(context: SSLContext, address: String, port: Int = PORT) : AutoCloseable {
+private fun validCredential(value: String): Boolean =
+    value.length == 32 && Wire.decode(value).size == 24
+
+internal fun credentialDigest(credential: String): String =
+    Wire.encode(MessageDigest.getInstance("SHA-256").digest(credential.encodeToByteArray()))
+
+internal interface PairedDevice {
+    fun digest(): String?
+    fun remember(digest: String)
+    fun revoke()
+}
+
+internal class LocalHost(
+    context: SSLContext,
+    address: String,
+    port: Int = PORT,
+    private val pairedDevice: PairedDevice,
+) : AutoCloseable {
     private val listener = (context.serverSocketFactory.createServerSocket() as SSLServerSocket).apply {
         enabledProtocols = supportedProtocols.filter { it == "TLSv1.3" || it == "TLSv1.2" }.toTypedArray()
         bind(InetSocketAddress(address, port), 2)
@@ -68,7 +99,13 @@ internal class LocalHost(context: SSLContext, address: String, port: Int = PORT)
         invitation = token to expires
     }
 
-    fun serve(onReady: (SignalChannel, Signal) -> Unit, onEnded: () -> Unit) {
+    fun revokeDevice() = synchronized(leaseLock) {
+        pairedDevice.revoke()
+        invitation = null
+        runCatching { activeSocket?.close() }
+    }
+
+    fun serve(onReady: (SignalChannel) -> Unit, onSignal: (Signal) -> Unit, onEnded: () -> Unit) {
         check(running.compareAndSet(false, true))
         thread(name = "wikall-listener", isDaemon = true) {
             while (!closed.get()) {
@@ -87,19 +124,33 @@ internal class LocalHost(context: SSLContext, address: String, port: Int = PORT)
                         socket.startHandshake()
                         val channel = SignalChannel(socket)
                         val hello = channel.receive()
-                        require(hello.type == SignalType.PAIR)
                         synchronized(leaseLock) {
-                            val (token, expiration) = requireNotNull(invitation)
-                            require(System.currentTimeMillis() < expiration && Wire.equal(token, requireNotNull(hello.token)))
+                            check(!closed.get())
+                            val payload = requireNotNull(hello.payload)
+                            when (hello.type) {
+                                SignalType.PAIR -> {
+                                    val (token, expiration) = requireNotNull(invitation)
+                                    val (submitted, credential) = payload.split('.')
+                                    require(System.currentTimeMillis() < expiration && Wire.equal(token, submitted))
+                                    pairedDevice.remember(credentialDigest(credential))
+                                    invitation = null
+                                }
+                                SignalType.REJOIN -> {
+                                    val expected = requireNotNull(pairedDevice.digest())
+                                    require(Wire.equal(expected, credentialDigest(payload)))
+                                }
+                                else -> error("Expected pairing or resume")
+                            }
                             channel.send(Signal(SignalType.READY, probeId))
-                            invitation = null
                         }
                         authenticated = true
+                        onReady(channel)
                         socket.soTimeout = 35_000
                         while (!closed.get()) {
                             val message = channel.receive()
+                            require(message.type !in setOf(SignalType.PAIR, SignalType.REJOIN, SignalType.READY))
                             if (message.type == SignalType.PING) channel.send(Signal(SignalType.PONG, message.id))
-                            onReady(channel, message)
+                            else onSignal(message)
                         }
                     }
                 } catch (_: Exception) {
@@ -128,7 +179,7 @@ internal class LocalClient(private val host: String, private val pin: String, pr
     private lateinit var channel: SignalChannel
     private val socket = pinnedTls(pin).socketFactory.createSocket() as SSLSocket
 
-    fun connect(token: String): SignalChannel {
+    fun connect(token: String?, credential: String): SignalChannel {
         socket.enabledProtocols = socket.supportedProtocols.filter { it == "TLSv1.3" || it == "TLSv1.2" }.toTypedArray()
         var phase = "الوصول إلى عنوان الخادم"
         try {
@@ -138,7 +189,9 @@ internal class LocalClient(private val host: String, private val pin: String, pr
             socket.startHandshake()
             phase = "الاقتران بالخادم"
             channel = SignalChannel(socket)
-            channel.send(Signal(SignalType.PAIR, probeId, token))
+            val hello = if (token == null) Signal(SignalType.REJOIN, probeId, credential)
+                else Signal(SignalType.PAIR, probeId, "$token.$credential")
+            channel.send(hello)
             check(channel.receive() == Signal(SignalType.READY, probeId))
             socket.soTimeout = 25_000
             return channel
