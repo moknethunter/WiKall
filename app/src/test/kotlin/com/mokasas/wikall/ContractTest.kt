@@ -53,6 +53,14 @@ class ContractTest {
         assertFalse(Wire.verified(first.public, issued.proof(Wire.token()), response))
     }
 
+    @Test fun sharedArchivesAcceptOnlyTheRequestedKindAndBoundedContents() {
+        val bytes = DeviceRequest(first.public, second.public).export(first.private)
+        val archive = packTransfer(Transfer.REQUEST, bytes)
+        assertArrayEquals(bytes, unpackTransfer(Transfer.REQUEST, archive))
+        assertThrows(IllegalArgumentException::class.java) { unpackTransfer(Transfer.ACTIVATION, archive) }
+        assertThrows(IllegalArgumentException::class.java) { packTransfer(Transfer.REQUEST, ByteArray(FILE_LIMIT + 1)) }
+    }
+
     @Test fun numbersAreStableAndLimitedToTenDistinctDevices() {
         val devices = mutableListOf<Enrollment>()
         for (index in 1..USER_LIMIT) {

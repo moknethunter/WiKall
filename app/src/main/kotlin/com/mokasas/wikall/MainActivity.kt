@@ -7,6 +7,9 @@ import android.content.pm.PackageManager
 import android.net.Uri
 import android.os.Build
 import android.os.Bundle
+import android.util.AtomicFile
+import androidx.core.content.FileProvider
+import java.io.File
 import androidx.activity.ComponentActivity
 import androidx.activity.enableEdgeToEdge
 import androidx.activity.compose.BackHandler
@@ -65,11 +68,12 @@ class MainActivity : ComponentActivity() {
     @Inject internal lateinit var controller: ConnectionController
     private var selectedMode by mutableStateOf(Mode.HOME)
     private data class ImportedActivation(val license: Activation, val bytes: ByteArray)
-    private data class SharedDocument(val uri: Uri, val mime: String)
+    private data class SharedDocument(val uri: Uri, val kind: Transfer)
     private var imported by mutableStateOf<ImportedActivation?>(null)
     private var request by mutableStateOf<DeviceRequest?>(null)
     private var exported by mutableStateOf<SharedDocument?>(null)
     private var note by mutableStateOf("")
+    private var preparingFile by mutableStateOf(false)
     private var resumed by mutableStateOf(false)
     private var attemptedAudio: UUID? = null
     private var microphoneAction: (() -> Unit)? = null
@@ -88,37 +92,56 @@ class MainActivity : ComponentActivity() {
     private val openRequest = registerForActivityResult(ActivityResultContracts.OpenDocument()) { uri ->
         uri?.let { import(it, true) }
     }
-    private val saveRequest = registerForActivityResult(ActivityResultContracts.CreateDocument(REQUEST_MIME)) { uri ->
-        if (uri != null) {
-            saveDocument(uri, REQUEST_MIME) {
-                val identity = withContext(Dispatchers.IO) { DeviceIdentity.load() }
-                "أرسل طلب الجهاز إلى هاتف الخادم." to identity.request.export(identity.signing)
-            }
+    private fun shareRequest() = prepareShare(Transfer.REQUEST) {
+        val identity = withContext(Dispatchers.IO) { DeviceIdentity.load() }
+        val serial = identity.request.serial.take(8)
+        val file = withContext(Dispatchers.IO) {
+            writeShareFile(File(cacheDir, "exports/requests/Wi-Call-Request-$serial.zip"),
+                Transfer.REQUEST, identity.request.export(identity.signing))
         }
-    }
-    private val saveActivation = registerForActivityResult(ActivityResultContracts.CreateDocument(ACTIVATION_MIME)) { uri ->
-        val device = request
-        if (uri != null && device != null) {
-            saveDocument(uri, ACTIVATION_MIME) {
-                val (number, bytes) = controller.issue(device)
-                request = null
-                "صدر تفعيل المستخدم $number. أرسل الملف إلى صاحب الطلب." to bytes
-            }
-        }
+        "أرسل طلب التفعيل إلى مسؤول الخادم." to file
     }
 
-    private fun saveDocument(uri: Uri, mime: String, produce: suspend () -> Pair<String, ByteArray>) {
+    private fun issueAndShare(device: DeviceRequest) = prepareShare(Transfer.ACTIVATION) {
+        val (number, bytes) = controller.issue(device)
+        val file = withContext(Dispatchers.IO) {
+            writeShareFile(File(filesDir, "exports/activations/Wi-Call-$number.zip"), Transfer.ACTIVATION, bytes)
+        }
+        request = null
+        "صدر تفعيل المستخدم $number. شاركه مع صاحب الطلب." to file
+    }
+
+    private fun writeShareFile(path: File, kind: Transfer, content: ByteArray): File {
+        check(path.parentFile?.let { it.isDirectory || it.mkdirs() } == true)
+        val storage = AtomicFile(path)
+        val output = storage.startWrite()
+        try {
+            output.write(packTransfer(kind, content))
+            storage.finishWrite(output)
+        } catch (failure: Exception) {
+            storage.failWrite(output)
+            throw failure
+        }
+        return path
+    }
+
+    private fun prepareShare(kind: Transfer, produce: suspend () -> Pair<String, File>) {
+        if (preparingFile) return
+        preparingFile = true
         lifecycleScope.launch {
-            runCatching {
-                val (summary, bytes) = produce()
-                withContext(Dispatchers.IO) {
-                    checkNotNull(contentResolver.openOutputStream(uri, "wt")).use { it.write(bytes) }
-                }
-                exported = SharedDocument(uri, mime)
+            try {
+                val (summary, file) = produce()
+                val uri = FileProvider.getUriForFile(this@MainActivity, "$packageName.activation-files", file)
+                val document = SharedDocument(uri, kind)
+                exported = document
                 note = summary
-            }.onFailure { failure ->
-                note = if (failure is CapacityReached) "وصل الخادم إلى الحد الأقصى وهو عشرة مستخدمين."
-                    else "تعذّر إعداد الملف. تأكد من مساحة التخزين وحالة الخادم."
+                share(document)
+            } catch (_: CapacityReached) {
+                note = "وصل الخادم إلى الحد الأقصى وهو عشرة مستخدمين."
+            } catch (_: Exception) {
+                note = "تعذّر إعداد الملف أو فتح المشاركة."
+            } finally {
+                preparingFile = false
             }
         }
     }
@@ -254,12 +277,12 @@ class MainActivity : ComponentActivity() {
                                 }
                                 HorizontalDivider()
                             }
-                            Action("استيراد طلب جهاز", true) { openRequest.launch(arrayOf("*/*")) }
+                            Action("استيراد طلب التفعيل", true) { openRequest.launch(arrayOf("*/*")) }
                             request?.let { pending ->
                                 Text("معرّف الطلب ${pending.serial.take(12)}", style = TextStyle(textDirection = TextDirection.Content))
-                                Action("إصدار ملف تفعيل") { saveActivation.launch("Wi-Call-${pending.serial.take(8)}.wiactivation") }
+                                Action("إصدار التفعيل ومشاركته") { issueAndShare(pending) }
                             }
-                            exported?.takeIf { it.mime == ACTIVATION_MIME }?.let { document ->
+                            exported?.takeIf { it.kind == Transfer.ACTIVATION }?.let { document ->
                                 Action("مشاركة ملف التفعيل", true) { share(document) }
                             }
                         }
@@ -268,7 +291,7 @@ class MainActivity : ComponentActivity() {
                 Mode.CLIENT -> {
                     val peer = session.peer
                     Panel(session.number?.let { "رقمي · $it" } ?: "الانضمام إلى خادم") {
-                        Text(session.status.ifBlank { "أنشئ طلب جهاز وأرسله لمسؤول الخادم، ثم استورد ملف التفعيل الذي يعطيك إياه." })
+                        Text(session.status.ifBlank { "اضغط طلب التفعيل وشاركه مع مسؤول الخادم، ثم استورد ملف التفعيل الذي يصدره لك." })
                         session.address?.let { Text(it, style = TextStyle(textDirection = TextDirection.Ltr)) }
                         if (peer == null && !session.busy) {
                             imported?.let { current ->
@@ -292,8 +315,8 @@ class MainActivity : ComponentActivity() {
                         Panel("المكالمة") { CallPane(session, peer) }
                     } else if (!session.busy) {
                         Panel("تفعيل هذا الهاتف") {
-                            Action("إنشاء طلب جهاز") { saveRequest.launch("Wi-Call.wirequest") }
-                            exported?.takeIf { it.mime == REQUEST_MIME }?.let { document ->
+                            Action("طلب التفعيل", action = ::shareRequest)
+                            exported?.takeIf { it.kind == Transfer.REQUEST }?.let { document ->
                                 Action("مشاركة طلب الجهاز", true) { share(document) }
                             }
                             Action("استيراد ملف التفعيل", true) { openActivation.launch(arrayOf("*/*")) }
@@ -465,7 +488,7 @@ class MainActivity : ComponentActivity() {
         if (uri.scheme != "content") return
         if (isRequest && controller.state.value.mode != Mode.SERVER) {
             selectedMode = Mode.SERVER
-            note = "شغّل الخادم ثم اختر استيراد طلب جهاز."
+            note = "شغّل الخادم ثم اختر استيراد طلب التفعيل."
             return
         }
         if (!isRequest) {
@@ -476,7 +499,9 @@ class MainActivity : ComponentActivity() {
         lifecycleScope.launch {
             runCatching {
                 withContext(Dispatchers.IO) {
-                    val bytes = readDocument(uri)
+                    val kind = if (isRequest) Transfer.REQUEST else Transfer.ACTIVATION
+                    val archive = checkNotNull(contentResolver.openInputStream(uri)).use { boundedRead(it, ARCHIVE_LIMIT) }
+                    val bytes = unpackTransfer(kind, archive)
                     if (isRequest) DeviceRequest.read(bytes)
                     else {
                         val identity = DeviceIdentity.load()
@@ -500,21 +525,9 @@ class MainActivity : ComponentActivity() {
         }
     }
 
-    private fun readDocument(uri: Uri): ByteArray =
-        checkNotNull(contentResolver.openInputStream(uri)).use { stream ->
-            val buffer = ByteArray(FILE_LIMIT + 1)
-            var size = 0
-            while (size < buffer.size) {
-                val read = stream.read(buffer, size, buffer.size - size)
-                if (read <= 0) break
-                size += read
-            }
-            buffer.copyOf(size)
-        }
-
     private fun share(document: SharedDocument) {
         val send = Intent(Intent.ACTION_SEND).apply {
-            type = document.mime
+            type = "application/zip"
             putExtra(Intent.EXTRA_STREAM, document.uri)
             clipData = ClipData.newRawUri("Wi-Call", document.uri)
             addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
@@ -524,6 +537,5 @@ class MainActivity : ComponentActivity() {
 
     private companion object {
         const val REQUEST_MIME = "application/vnd.wikall.request"
-        const val ACTIVATION_MIME = "application/vnd.wikall.activation"
     }
 }
