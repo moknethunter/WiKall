@@ -1,11 +1,15 @@
 package com.mokasas.wikall
 
+import android.Manifest
 import androidx.test.ext.junit.runners.AndroidJUnit4
 import androidx.test.platform.app.InstrumentationRegistry
 import java.net.Inet4Address
 import java.net.NetworkInterface
 import java.security.KeyPairGenerator
 import java.util.UUID
+import java.util.concurrent.CountDownLatch
+import java.util.concurrent.TimeUnit
+import java.util.concurrent.atomic.AtomicBoolean
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertNotNull
 import org.junit.Assert.assertTrue
@@ -47,5 +51,42 @@ class AndroidActivationTest {
         }
         store.save(SavedConnection(lan, unlocked, bytes))
         assertEquals(unlocked.number, store.saved(DeviceIdentity.load())?.activation?.number)
+    }
+    @Test fun androidWebRtcNegotiatesAnAudioSessionOnLocalUdp() {
+        val instrumentation = InstrumentationRegistry.getInstrumentation()
+        val context = instrumentation.targetContext
+        instrumentation.uiAutomation.grantRuntimePermission(context.packageName, Manifest.permission.RECORD_AUDIO)
+
+        val connected = CountDownLatch(2)
+        val failed = AtomicBoolean()
+        val callerReady = AtomicBoolean()
+        val receiverReady = AtomicBoolean()
+        lateinit var caller: VoiceMedia
+        lateinit var receiver: VoiceMedia
+        fun observeOnce(state: CallState, ready: AtomicBoolean) {
+            if (state == CallState.CONNECTED && ready.compareAndSet(false, true)) connected.countDown()
+        }
+        fun fail() {
+            failed.set(true)
+            while (connected.count > 0) connected.countDown()
+        }
+        try {
+            instrumentation.runOnMainSync {
+                caller = VoiceMedia(context, { type, data -> receiver.receive(type, data) },
+                    { state -> observeOnce(state, callerReady) }, ::fail)
+                receiver = VoiceMedia(context, { type, data -> caller.receive(type, data) },
+                    { state -> observeOnce(state, receiverReady) }, ::fail)
+                receiver.start(outgoing = false)
+                caller.start(outgoing = true)
+            }
+
+            assertTrue("Both WebRTC audio peers must negotiate local UDP", connected.await(25, TimeUnit.SECONDS))
+            assertTrue("WebRTC peer setup failed", !failed.get())
+        } finally {
+            instrumentation.runOnMainSync {
+                runCatching { caller.close() }
+                runCatching { receiver.close() }
+            }
+        }
     }
 }
