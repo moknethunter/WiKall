@@ -51,6 +51,8 @@ internal class NumberRouting {
         return RoutedSignal(from, to, message)
     }
 
+    fun hasAcceptedCall(number: String): Boolean = calls.values.any { it.accepted && it.other(number) != null }
+
     fun disconnected(number: String): RoutedSignal? {
         val call = calls.entries.firstOrNull { it.value.other(number) != null } ?: return null
         val other = checkNotNull(call.value.other(number))

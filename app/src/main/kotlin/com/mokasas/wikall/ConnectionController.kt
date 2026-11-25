@@ -46,7 +46,7 @@ internal data class SessionState(
     val internetReady: Boolean = false,
     val ice: String = "",
     val publicKey: String? = null,
-    val missed: List<CallHistory> = emptyList(),
+    val missed: List<IncomingMissed> = emptyList(),
 )
 
 @Singleton
@@ -78,6 +78,7 @@ internal class ConnectionController @Inject constructor(
     private var monitoring = false
     private var topology: Pair<Network?, List<String>>? = null
     private var networkChange: Runnable? = null
+    private var hotspotPoll: Runnable? = null
     private val connectivity = context.getSystemService(ConnectivityManager::class.java)
     private val defaultCallback = networkCallback()
     private val lanCallback = networkCallback()
@@ -146,13 +147,18 @@ internal class ConnectionController @Inject constructor(
                         { number, connection -> onMain(current) {
                             if (attempt != lanAttempt) return@onMain
                             onlineChannels[number] = connection
+                            if (!internetCall && state.value.peer == number && call.accepted) {
+                                selectPeer(number, connection)
+                                requestRepair()
+                            }
                             publish(state.value.copy(onlineUsers = onlineChannels.keys.toSet(), status = "المستخدم $number متصل."))
                         } },
                         { number, message -> onMain(current) { if (attempt == lanAttempt && !internetCall) receivedFrom(number, message) } },
                         { number -> onMain(current) {
                             if (attempt != lanAttempt) return@onMain
                             onlineChannels.remove(number)
-                            if (!internetCall && state.value.peer == number) disconnect("المستخدم $number غير متصل.")
+                            if (!internetCall && state.value.peer == number)
+                                disconnect("انقطع المسار المحلي للمستخدم $number.", preserveAccepted = true)
                             publish(state.value.copy(onlineUsers = onlineChannels.keys.toSet()))
                         } },
                     )
@@ -302,6 +308,7 @@ internal class ConnectionController @Inject constructor(
                         }
                     }
                     probe()
+                    if (!internetCall && call.accepted) requestRepair()
                     heartbeat = object : Runnable {
                         override fun run() {
                             if (current != generation || channel !== active) return
@@ -330,7 +337,7 @@ internal class ConnectionController @Inject constructor(
                         addressFailure -> "تعذّر العثور على الخادم بهذا العنوان. شغّله على الشبكة الحالية أو أدخل عنوانه عبر «تغيير عنوان الخادم». التفعيل محفوظ إن سبق استخدامه."
                         else -> failure.message.orEmpty().ifBlank { "تعذّر الاتصال المحلي." }
                     }
-                    disconnect(reason)
+                    disconnect(reason, preserveAccepted = true)
                     if ((online || addressFailure && retryCount > 0) && retryCount < RETRY_DELAYS.size) {
                         val delay = RETRY_DELAYS[retryCount++]
                         retry = Runnable { locate(saved, false) }.also { main.postDelayed(it, delay) }
@@ -369,7 +376,14 @@ internal class ConnectionController @Inject constructor(
         val media = VoiceMedia(
             context,
             { type, payload -> if (call.id == id && call.accepted) send(Signal(type, id, payload)) },
-            { status -> if (call.id == id) { call.media(status); changed() } },
+            { status ->
+                if (call.id == id) {
+                    val recovering = status == CallState.RECONNECTING && call.state != CallState.RECONNECTING
+                    call.media(status)
+                    changed()
+                    if (recovering) requestRepair()
+                }
+            },
             { if (call.id == id) failMedia() },
             internetIce.takeIf { internetCall },
             { if (call.id == id) publish(state.value.copy(ice = it)) },
@@ -522,7 +536,18 @@ internal class ConnectionController @Inject constructor(
             val peer = state.value.peer
             if (completed != null && peer != null) {
                 val item = CallHistory(completed.toString(), peer, next.name, System.currentTimeMillis())
-                sender.execute { runCatching { store.record(item) } }
+                val incomingMissed = !call.outgoing && next == CallState.MISSED
+                val account = directoryAccount()
+                val current = generation
+                sender.execute {
+                    runCatching {
+                        store.record(item)
+                        if (incomingMissed && account != null) {
+                            store.recordMissed(IncomingMissed(account, item.id, item.peer, item.endedAt))
+                            onMain(current) { loadMissed() }
+                        }
+                    }
+                }
             }
         }
         if (id != trackedId || next != trackedState) {
@@ -577,7 +602,7 @@ internal class ConnectionController @Inject constructor(
         }
     }
 
-    private fun disconnect(reason: String) {
+    private fun disconnect(reason: String, preserveAccepted: Boolean = false) {
         channel = null
         waiting = null
         heartbeat?.let(main::removeCallbacks)
@@ -586,11 +611,12 @@ internal class ConnectionController @Inject constructor(
             val invite = pendingInternet?.takeIf { call.id == it.id && call.state == CallState.CALLING }
             if (invite != null) fallback(invite)
             else {
-                call.disconnected()
+                if (preserveAccepted && call.accepted) call.media(CallState.RECONNECTING)
+                else call.disconnected()
                 changed()
             }
         }
-        publish(state.value.copy(peer = state.value.peer.takeIf { internetCall }, latency = null, busy = false, status = reason))
+        publish(state.value.copy(peer = state.value.peer.takeIf { internetCall || preserveAccepted && call.accepted }, latency = null, busy = false, status = reason))
     }
 
     fun stop() {
@@ -651,10 +677,13 @@ internal class ConnectionController @Inject constructor(
         openDirectory()
     }
 
+    private fun directoryAccount() = directoryIdentity?.let { (realm, number) -> "$realm:$number" }
+
     private fun loadMissed() {
+        val account = directoryAccount() ?: return
         val current = generation
         sender.execute {
-            val items = runCatching { store.missed() }.getOrDefault(emptyList())
+            val items = runCatching { store.missed(account) }.getOrDefault(emptyList())
             onMain(current) { publish(state.value.copy(missed = items)) }
         }
     }
@@ -711,7 +740,7 @@ internal class ConnectionController @Inject constructor(
                 sender.execute {
                     if (current != generation) return@execute
                     val row = runCatching {
-                        store.record(CallHistory(item.id.toString(), item.number, CallState.MISSED.name, item.at * 1000))
+                        store.recordMissed(IncomingMissed("$realm:$number", item.id.toString(), item.number, item.at * 1000))
                     }.getOrNull() ?: return@execute
                     onMain(current) {
                         if (version == directoryVersion) directory?.acknowledge(item.id)
@@ -769,6 +798,13 @@ internal class ConnectionController @Inject constructor(
                 .addTransportType(NetworkCapabilities.TRANSPORT_ETHERNET).build(), lanCallback)
         }
         monitoring = true
+        hotspotPoll = object : Runnable {
+            override fun run() {
+                if (!monitoring) return
+                if (state.value.mode == Mode.SERVER && currentTopology() != topology) scheduleNetworkCheck()
+                main.postDelayed(this, 4_000L)
+            }
+        }.also { main.postDelayed(it, 4_000L) }
     }
 
     private fun unmonitorNetwork() {
@@ -778,6 +814,8 @@ internal class ConnectionController @Inject constructor(
         runCatching { connectivity.unregisterNetworkCallback(lanCallback) }
         networkChange?.let(main::removeCallbacks)
         networkChange = null
+        hotspotPoll?.let(main::removeCallbacks)
+        hotspotPoll = null
     }
 
     private fun currentTopology() = connectivity.activeNetwork to
@@ -809,7 +847,7 @@ internal class ConnectionController @Inject constructor(
                             }
                         }
                         Mode.CLIENT -> savedClient?.let {
-                            if (channel == null || !call.accepted || internetCall) {
+                            if (channel == null || !call.accepted || internetCall || updated.second != previous?.second) {
                                 discovery.close()
                                 val old = client
                                 client = null
@@ -828,7 +866,9 @@ internal class ConnectionController @Inject constructor(
     private fun requestRepair() {
         val id = call.id ?: return
         if (!call.accepted || voice == null) return
+        if (internetCall && internetIce == null || !internetCall && channel == null && host == null) return
         if (call.outgoing) {
+            if (voice?.canRestart() != true) return
             send(Signal(SignalType.RESTART, id))
             voice?.restart(true)
         } else {

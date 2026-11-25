@@ -37,6 +37,9 @@ internal data class ConnectionProfile(@PrimaryKey val slot: Int, val address: St
 @Entity
 internal data class CallHistory(@PrimaryKey val id: String, val peer: String, val state: String, val endedAt: Long)
 
+@Entity(primaryKeys = ["account", "id"])
+internal data class IncomingMissed(val account: String, val id: String, val peer: String, val endedAt: Long)
+
 @Dao
 internal abstract class LocalData {
     @Query("SELECT * FROM AssignedDevice ORDER BY number")
@@ -68,13 +71,20 @@ internal abstract class LocalData {
     abstract fun forgetProfile()
 
     @Insert(onConflict = OnConflictStrategy.IGNORE)
-    abstract fun record(call: CallHistory): Long
+    abstract fun record(call: CallHistory)
 
-    @Query("SELECT * FROM CallHistory WHERE state = 'MISSED' ORDER BY endedAt DESC LIMIT 20")
-    abstract fun missed(): List<CallHistory>
+    @Insert(onConflict = OnConflictStrategy.IGNORE)
+    abstract fun recordMissed(call: IncomingMissed): Long
+
+    @Query("SELECT * FROM IncomingMissed WHERE account = :account ORDER BY endedAt DESC LIMIT 20")
+    abstract fun missed(account: String): List<IncomingMissed>
 }
 
-@Database(entities = [AssignedDevice::class, ConnectionProfile::class, CallHistory::class], version = 2, exportSchema = false)
+@Database(
+    entities = [AssignedDevice::class, ConnectionProfile::class, CallHistory::class, IncomingMissed::class],
+    version = 3,
+    exportSchema = false,
+)
 internal abstract class LocalDatabase : RoomDatabase() {
     abstract fun data(): LocalData
 }
@@ -98,6 +108,15 @@ internal class CallStore @Inject constructor(@ApplicationContext context: Contex
                 """.trimIndent())
                 db.execSQL("CREATE UNIQUE INDEX IF NOT EXISTS index_AssignedDevice_serial ON AssignedDevice(serial)")
             }
+        }, object : Migration(2, 3) {
+            override fun migrate(db: SupportSQLiteDatabase) {
+                db.execSQL("""
+                    CREATE TABLE IF NOT EXISTS IncomingMissed (
+                        account TEXT NOT NULL, id TEXT NOT NULL, peer TEXT NOT NULL, endedAt INTEGER NOT NULL,
+                        PRIMARY KEY(account, id)
+                    )
+                """.trimIndent())
+            }
         }).build().data()
 
     override fun find(number: String) = data.device(number)?.enrollment()
@@ -116,5 +135,6 @@ internal class CallStore @Inject constructor(@ApplicationContext context: Contex
 
     fun forget() = data.forgetProfile()
     fun record(call: CallHistory) = data.record(call)
-    fun missed() = data.missed()
+    fun recordMissed(call: IncomingMissed) = data.recordMissed(call)
+    fun missed(account: String) = data.missed(account)
 }

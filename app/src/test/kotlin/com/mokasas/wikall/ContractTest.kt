@@ -161,8 +161,18 @@ class ContractTest {
                     val offer = Signal(SignalType.OFFER, peerCall.id, "sample audio offer")
                     firstClient.send(offer)
                     assertEquals(offer, secondClient.receive())
-                    secondClient.send(Signal(SignalType.END, peerCall.id))
-                    assertEquals(Signal(SignalType.END, peerCall.id), firstClient.receive())
+                    firstClient.close()
+                    LocalClient("127.0.0.1", Wire.pin(pub), host.localPort).use { reconnected ->
+                        reconnected.connect(activation(a), first.private)
+                        val repair = Signal(SignalType.REPAIR, peerCall.id)
+                        secondClient.send(repair)
+                        assertEquals(repair, reconnected.receive())
+                        val restart = Signal(SignalType.RESTART, peerCall.id)
+                        reconnected.send(restart)
+                        assertEquals(restart, secondClient.receive())
+                        secondClient.send(Signal(SignalType.END, peerCall.id))
+                        assertEquals(Signal(SignalType.END, peerCall.id), reconnected.receive())
+                    }
                     val ping = UUID.randomUUID()
                     secondClient.send(Signal(SignalType.PING, ping))
                     assertEquals(Signal(SignalType.PONG, ping), secondClient.receive())
@@ -195,6 +205,17 @@ class ContractTest {
         assertNull(routing.receive(a, call) { true })
         val absent = call.copy(id = UUID.randomUUID())
         assertEquals(SignalType.UNAVAILABLE, routing.receive(a, absent) { false }?.message?.type)
+    }
+
+    @Test fun internetAllowsTurnWhileLanRejectsIt() {
+        val relay = "candidate:1 1 UDP 1 203.0.113.10 45000 typ relay"
+        assertTrue(internetIce(relay))
+        assertFalse(lanIce(relay))
+        assertFalse(internetIce("candidate:1 1 UDP 1 203.0.113.10 0 typ relay"))
+        val sdp = "v=0\r\nm=audio 9 UDP/TLS/RTP/SAVPF 111\r\na=$relay"
+        assertTrue(audioOnly(sdp, ::internetIce))
+        assertFalse(audioOnly(sdp))
+        assertFalse(audioOnly("$sdp\r\nm=video 9 UDP/TLS/RTP/SAVPF 98", ::internetIce))
     }
 
     @Test fun mediaRequiresAnAcceptedInvitationAndOnlySupportsLanAudio() {

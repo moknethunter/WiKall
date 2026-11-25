@@ -112,6 +112,10 @@ internal class VoiceMedia(
             SignalType.OFFER, SignalType.ANSWER -> {
                 if (settingRemote || remoteDescription == payload || !audioOnly(payload, ::validCandidate)) return
                 if (remoteReady && type == SignalType.ANSWER) return
+                if (remoteReady && type == SignalType.OFFER) {
+                    localReady = false
+                    localIce.clear()
+                }
                 settingRemote = true
                 val sdpType = if (type == SignalType.OFFER) SessionDescription.Type.OFFER else SessionDescription.Type.ANSWER
                 connection.setRemoteDescription(setSdp {
@@ -131,15 +135,17 @@ internal class VoiceMedia(
         }
     }
 
+    fun canRestart(): Boolean = !restarting && !settingRemote &&
+        peer?.signalingState() == PeerConnection.SignalingState.STABLE
+
     fun restart(outgoing: Boolean) {
         val connection = peer ?: return
-        if (restarting || settingRemote || connection.signalingState() != PeerConnection.SignalingState.STABLE) return
+        if (!canRestart()) return
         restarting = true
         remoteReady = false
         localReady = false
         remoteIce.clear()
         localIce.clear()
-        onState(CallState.RECONNECTING)
         if (outgoing) {
             connection.restartIce()
             connection.createOffer(createSdp(SignalType.OFFER), MediaConstraints())
