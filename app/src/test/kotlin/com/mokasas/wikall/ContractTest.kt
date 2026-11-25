@@ -4,8 +4,6 @@ import java.io.File
 import java.nio.file.Files
 import java.security.KeyStore
 import java.util.UUID
-import javax.net.ssl.SSLContext
-import javax.net.ssl.KeyManagerFactory
 import org.junit.Assert.*
 import org.junit.Test
 import org.junit.BeforeClass
@@ -68,10 +66,7 @@ class ContractTest {
     }
 
     @Test fun tlsChecksServerKeyAndConsumesPairingToken() {
-        val manager = KeyManagerFactory.getInstance(KeyManagerFactory.getDefaultAlgorithm())
-        manager.init(store, password)
-        val context = SSLContext.getInstance("TLS")
-        context.init(manager.keyManagers, null, null)
+        val context = ServerIdentity(entry).tls()
         val paired = object : PairedDevice {
             private var saved: String? = null
             override fun digest() = saved

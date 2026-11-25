@@ -27,7 +27,11 @@ android {
         targetCompatibility = JavaVersion.VERSION_17
     }
     // These libraries embed equivalent upstream license metadata.
-    packaging.resources.excludes += setOf("META-INF/AL2.0", "META-INF/LGPL2.1")
+    packaging.resources.excludes += setOf(
+        "META-INF/AL2.0", "META-INF/LGPL2.1", "META-INF/LICENSE", "META-INF/LICENSE.txt",
+        "META-INF/NOTICE", "META-INF/NOTICE.txt", "META-INF/INDEX.LIST",
+    )
+    packaging.resources.merges += "META-INF/io.netty.versions.properties"
 
     System.getenv("WIKALL_DEBUG_KEYSTORE")?.takeIf { it.isNotBlank() }?.let { key ->
         signingConfigs.getByName("debug") { storeFile = file(key) }
@@ -49,6 +53,9 @@ dependencies {
     implementation(libs.room.runtime)
     implementation(libs.hilt.android)
     implementation(libs.webrtc)
+    implementation(libs.ktor.server.netty)
+    implementation(libs.ktor.server.websockets)
+    implementation(libs.okhttp)
     kapt(libs.room.compiler)
     kapt(libs.hilt.compiler)
     testImplementation(libs.junit)

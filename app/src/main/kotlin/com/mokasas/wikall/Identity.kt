@@ -9,6 +9,7 @@ import java.security.PrivateKey
 import java.security.cert.X509Certificate
 import javax.net.ssl.KeyManager
 import javax.net.ssl.SSLContext
+import javax.net.ssl.SSLEngine
 import javax.net.ssl.X509ExtendedKeyManager
 
 internal class ServerIdentity(val entry: KeyStore.PrivateKeyEntry) {
@@ -19,6 +20,8 @@ internal class ServerIdentity(val entry: KeyStore.PrivateKeyEntry) {
             override fun getServerAliases(keyType: String?, issuers: Array<out Principal>?) =
                 if (keyType == "RSA") arrayOf(ALIAS) else null
             override fun chooseServerAlias(keyType: String?, issuers: Array<out Principal>?, socket: java.net.Socket?) =
+                if (keyType == "RSA") ALIAS else null
+            override fun chooseEngineServerAlias(keyType: String?, issuers: Array<out Principal>?, engine: SSLEngine?) =
                 if (keyType == "RSA") ALIAS else null
             override fun getCertificateChain(alias: String?): Array<X509Certificate>? =
                 if (alias == ALIAS) entry.certificateChain.map { it as X509Certificate }.toTypedArray() else null

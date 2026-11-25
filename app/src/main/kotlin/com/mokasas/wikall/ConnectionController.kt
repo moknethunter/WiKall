@@ -36,7 +36,10 @@ internal class ConnectionController @Inject constructor(
 ) {
     private val main = Handler(Looper.getMainLooper())
     private val worker = Executors.newCachedThreadPool()
+    private val hostControl = Executors.newSingleThreadExecutor()
     private val sender = Executors.newSingleThreadExecutor()
+    // Accessed only on hostControl, including while the listener is still starting.
+    private var boundHost: LocalHost? = null
     private val discovery = LanDiscovery(context)
     @Volatile private var generation = 0
     private var host: LocalHost? = null
@@ -71,16 +74,16 @@ internal class ConnectionController @Inject constructor(
         stop()
         publish(SessionState(mode = Mode.SERVER, busy = true, status = "جارٍ تشغيل الخادم…"))
         val current = generation
-        worker.execute {
+        hostControl.execute {
             val result = runCatching {
+                check(current == generation)
                 val keys = ServerIdentity.load()
-                keys to LocalHost(keys.tls(), address, pairedDevice = store)
+                val server = LocalHost(keys.tls(), address, pairedDevice = store)
+                boundHost = server
+                keys to server
             }
             main.post {
-                if (current != generation) {
-                    result.getOrNull()?.second?.close()
-                    return@post
-                }
+                if (current != generation) return@post
                 result.onSuccess { (keys, server) ->
                     host = server
                     identity = keys
@@ -387,7 +390,6 @@ internal class ConnectionController @Inject constructor(
         retryCount = 0
         discovery.close()
         val oldClient = client
-        val oldHost = host
         client = null
         host = null
         identity = null
@@ -395,9 +397,10 @@ internal class ConnectionController @Inject constructor(
         disconnect("")
         call = LocalCall()
         publish(SessionState())
-        if (oldClient != null || oldHost != null) {
-            runCatching { oldClient?.close() }
-            runCatching { oldHost?.close() }
+        runCatching { oldClient?.close() }
+        hostControl.execute {
+            runCatching { boundHost?.close() }
+            boundHost = null
         }
     }
 
