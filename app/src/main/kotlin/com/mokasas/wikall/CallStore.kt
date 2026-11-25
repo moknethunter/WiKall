@@ -68,7 +68,10 @@ internal abstract class LocalData {
     abstract fun forgetProfile()
 
     @Insert(onConflict = OnConflictStrategy.IGNORE)
-    abstract fun record(call: CallHistory)
+    abstract fun record(call: CallHistory): Long
+
+    @Query("SELECT * FROM CallHistory WHERE state = 'MISSED' ORDER BY endedAt DESC LIMIT 20")
+    abstract fun missed(): List<CallHistory>
 }
 
 @Database(entities = [AssignedDevice::class, ConnectionProfile::class, CallHistory::class], version = 2, exportSchema = false)
@@ -113,4 +116,5 @@ internal class CallStore @Inject constructor(@ApplicationContext context: Contex
 
     fun forget() = data.forgetProfile()
     fun record(call: CallHistory) = data.record(call)
+    fun missed() = data.missed()
 }

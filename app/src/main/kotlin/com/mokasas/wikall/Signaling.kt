@@ -22,7 +22,7 @@ import javax.net.ssl.SSLSocket
 import kotlin.concurrent.thread
 
 internal enum class SignalType {
-    CHALLENGE, AUTH, READY, PING, PONG, INVITE, ACCEPT, REJECT, BUSY, UNAVAILABLE, TIMEOUT, END, OFFER, ANSWER, ICE
+    CHALLENGE, AUTH, READY, PING, PONG, INVITE, ACCEPT, REJECT, BUSY, UNAVAILABLE, TIMEOUT, END, OFFER, ANSWER, ICE, RESTART, REPAIR
 }
 
 internal data class Signal(val type: SignalType, val id: UUID, val payload: String? = null, val number: String? = null)
