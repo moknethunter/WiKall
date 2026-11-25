@@ -10,7 +10,10 @@ import java.security.spec.X509EncodedKeySpec
 import java.util.Base64
 import kotlinx.serialization.json.Json
 import kotlinx.serialization.json.JsonObject
+import kotlinx.serialization.json.JsonPrimitive
+import kotlinx.serialization.json.buildJsonArray
 import kotlinx.serialization.json.buildJsonObject
+import kotlinx.serialization.json.jsonArray
 import kotlinx.serialization.json.jsonObject
 import kotlinx.serialization.json.jsonPrimitive
 import kotlinx.serialization.json.put
@@ -54,11 +57,14 @@ internal data class Profile(val host: String, val token: String, val expires: Lo
     fun export(privateKey: PrivateKey): ByteArray {
         val body = buildJsonObject {
             put("format", "mokasas-profile")
-            put("protocolVersion", 1)
+            put("protocolVersion", 2)
+            put("serverId", pin)
             put("host", host)
+            put("knownAddresses", buildJsonArray { add(JsonPrimitive(host)) })
             put("port", PORT)
             put("userNumber", "1001")
             put("pairingToken", token)
+            put("validFromEpochMillis", expires - LIFETIME)
             put("expiresAtEpochMillis", expires)
             put("serverPublicKey", Wire.encode(key.encoded))
         }.toString().toByteArray()
@@ -74,7 +80,7 @@ internal data class Profile(val host: String, val token: String, val expires: Lo
 
         fun read(bytes: ByteArray, now: Long = System.currentTimeMillis()): Profile {
             require(bytes.size in 1..MAX_SIZE)
-            val envelope = Json.parseToJsonElement(bytes.decodeToString()).jsonObject
+            val envelope = Json.parseToJsonElement(bytes.decodeToString(throwOnInvalidSequence = true)).jsonObject
             require(envelope.keys == setOf("profile", "signature"))
             val body = Wire.decode(envelope.value("profile"))
             val json = Json.parseToJsonElement(body.decodeToString()).jsonObject
@@ -82,11 +88,19 @@ internal data class Profile(val host: String, val token: String, val expires: Lo
                 X509EncodedKeySpec(Wire.decode(json.value("serverPublicKey")))
             )
             require(Wire.verified(key, body, Wire.decode(envelope.value("signature"))))
-            require(json.value("format") == "mokasas-profile" && json.value("protocolVersion") == "1")
+            val version = json.value("protocolVersion")
+            require(json.value("format") == "mokasas-profile" && version in setOf("1", "2"))
             require(json.value("port") == PORT.toString() && json.value("userNumber") == "1001")
             val host = json.value("host")
             val token = json.value("pairingToken")
             val expires = json.value("expiresAtEpochMillis").toLong()
+            if (version == "2") {
+                val knownAddresses = json.getValue("knownAddresses").jsonArray
+                val validFrom = json.value("validFromEpochMillis").toLong()
+                require(json.value("serverId") == Wire.pin(key))
+                require(knownAddresses.map { it.jsonPrimitive.content } == listOf(host))
+                require(validFrom == expires - LIFETIME && validFrom <= now + 30_000)
+            }
             require(privateIpv4(host) && Wire.decode(token).size == 24)
             require(expires > now && expires <= now + LIFETIME + 30_000) { "انتهت صلاحية الملف أو ساعة الهاتف تحتاج إلى ضبط" }
             return Profile(host, token, expires, key)

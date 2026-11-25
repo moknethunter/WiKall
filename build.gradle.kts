@@ -1,19 +1,14 @@
-val distribution = gradle.gradleHomeDir ?: error("Gradle distribution directory is unavailable")
-
-tasks.register<Exec>("assembleDebug") {
-    group = "build"
-    description = "Compile, align, sign, and verify the Android test APK."
-    environment("WIKALL_GRADLE_LIB", distribution.resolve("lib"))
-    commandLine("bash", "tools/android-build.sh", "apk")
+plugins {
+    alias(libs.plugins.android.application) apply false
+    alias(libs.plugins.kotlin.android) apply false
+    alias(libs.plugins.kotlin.compose) apply false
+    alias(libs.plugins.kotlin.kapt) apply false
+    alias(libs.plugins.hilt) apply false
 }
 
-tasks.register<Exec>("test") {
-    group = "verification"
-    description = "Run JVM contract tests, including a real loopback TLS session."
-    environment("WIKALL_GRADLE_LIB", distribution.resolve("lib"))
-    commandLine("bash", "tools/android-build.sh", "test")
-}
-
-tasks.register<Delete>("clean") {
-    delete(layout.buildDirectory)
+tasks.register<Copy>("assembleDebug") {
+    dependsOn(":app:assembleDebug")
+    from(layout.projectDirectory.file("app/build/outputs/apk/debug/app-debug.apk"))
+    into(layout.buildDirectory.dir("outputs/apk"))
+    rename { "Wi-Call-Debug.apk" }
 }

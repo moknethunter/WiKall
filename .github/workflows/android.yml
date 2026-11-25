@@ -1,4 +1,4 @@
-name: Build WiKall APK
+name: Build Wi-Call APK
 
 on:
   push:
@@ -14,7 +14,7 @@ jobs:
   android:
     name: Test and assemble debug APK
     runs-on: ubuntu-24.04
-    timeout-minutes: 15
+    timeout-minutes: 25
 
     steps:
       - name: Check out the repository
@@ -37,12 +37,12 @@ jobs:
           fi
 
       - name: Run JVM tests and build APK
-        run: env -u GRADLE_HOME ./gradlew --no-daemon test assembleDebug
+        run: env -u GRADLE_HOME ./gradlew --no-daemon :app:testDebugUnitTest :app:lintDebug :assembleDebug
 
       - name: Upload the signed debug APK
         uses: actions/upload-artifact@v4
         with:
-          name: WiKall-Debug
-          path: build/outputs/apk/WiKall-Debug.apk
+          name: Wi-Call-Debug
+          path: build/outputs/apk/Wi-Call-Debug.apk
           if-no-files-found: error
           retention-days: 14

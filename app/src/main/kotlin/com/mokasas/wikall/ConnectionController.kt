@@ -1,17 +1,47 @@
 package com.mokasas.wikall
 
+import android.content.Context
 import android.os.Handler
 import android.os.Looper
 import android.os.SystemClock
+import dagger.hilt.android.qualifiers.ApplicationContext
+import javax.inject.Inject
+import javax.inject.Singleton
 import java.net.Inet4Address
 import java.net.NetworkInterface
 import java.util.UUID
 import java.util.concurrent.Executors
+import kotlinx.coroutines.flow.MutableStateFlow
+import kotlinx.coroutines.flow.asStateFlow
 
-internal class ConnectionController(private val update: () -> Unit) {
+internal enum class Mode { HOME, SERVER, CLIENT }
+
+internal data class SessionState(
+    val mode: Mode = Mode.HOME,
+    val status: String = "",
+    val address: String? = null,
+    val pin: String? = null,
+    val peer: String? = null,
+    val latency: Long? = null,
+    val busy: Boolean = false,
+    val callId: UUID? = null,
+    val callState: CallState = CallState.IDLE,
+    val muted: Boolean = false,
+)
+
+@Singleton
+internal class ConnectionController @Inject constructor(
+    @ApplicationContext private val context: Context,
+    private val store: CallStore,
+) {
     private val main = Handler(Looper.getMainLooper())
-    private val worker = Executors.newSingleThreadExecutor()
-    private var generation = 0
+    private val worker = Executors.newCachedThreadPool()
+    private val hostControl = Executors.newSingleThreadExecutor()
+    private val sender = Executors.newSingleThreadExecutor()
+    // Accessed only on hostControl, including while the listener is still starting.
+    private var boundHost: LocalHost? = null
+    private val discovery = LanDiscovery(context)
+    @Volatile private var generation = 0
     private var host: LocalHost? = null
     private var client: LocalClient? = null
     private var channel: SignalChannel? = null
@@ -20,22 +50,19 @@ internal class ConnectionController(private val update: () -> Unit) {
     private var waiting: Pair<UUID, Long>? = null
     private var timer: Runnable? = null
     private var heartbeat: Runnable? = null
-    private val call = TestCall()
-    val callState: CallState get() = call.state
-    val hasCall: Boolean get() = call.id != null
-    val connected: Boolean get() = channel != null
-    val hosting: Boolean get() = host != null
-    var busy = false
-        private set
-    var status = ""
-        private set
-    var latency: Long? = null
-        private set
-    var pin: String? = null
-        private set
+    private var retry: Runnable? = null
+    private var retryCount = 0
+    private var call = LocalCall()
+    private var voice: VoiceMedia? = null
+    private val pendingMedia = ArrayDeque<Signal>()
+    private var trackedId: UUID? = null
+    private var trackedState = CallState.IDLE
+    private val mutable = MutableStateFlow(SessionState())
+    val state = mutable.asStateFlow()
+    var onUpdate: ((SessionState) -> Unit)? = null
 
     fun listAddresses(): List<String> = NetworkInterface.getNetworkInterfaces().toList()
-        .filter { it.isUp && !it.isLoopback && it.name.startsWithAny("wlan", "swlan", "ap", "softap", "eth", "en", "p2p") }
+        .filter { it.isUp && !it.isLoopback && LAN_INTERFACES.any(it.name::startsWith) }
         .flatMap { it.inetAddresses.toList() }
         .filterIsInstance<Inet4Address>()
         .mapNotNull { it.hostAddress }
@@ -45,44 +72,36 @@ internal class ConnectionController(private val update: () -> Unit) {
     fun start(address: String) {
         require(privateIpv4(address))
         stop()
-        busy = true
-        status = "جارٍ تشغيل الخادم…"
-        update()
+        publish(SessionState(mode = Mode.SERVER, busy = true, status = "جارٍ تشغيل الخادم…"))
         val current = generation
-        worker.execute {
+        hostControl.execute {
             val result = runCatching {
+                check(current == generation)
                 val keys = ServerIdentity.load()
-                keys to LocalHost(keys.tls(), address)
+                val server = LocalHost(keys.tls(), address, pairedDevice = store)
+                boundHost = server
+                keys to server
             }
             main.post {
-                if (current != generation) {
-                    result.getOrNull()?.second?.close()
-                    return@post
-                }
-                busy = false
+                if (current != generation) return@post
                 result.onSuccess { (keys, server) ->
                     host = server
                     identity = keys
                     hostAddress = address
-                    pin = Wire.pin(keys.entry.certificate.publicKey)
-                    status = "الخادم يستمع على $address:$PORT"
-                    server.serve({ connection, message ->
-                        main.post {
-                            if (generation == current) {
-                                if (channel == null) {
-                                    channel = connection
-                                    status = "اقترن المستخدم 1001"
-                                }
-                                received(message)
-                            }
-                        }
-                    }, {
-                        main.post {
-                            if (generation == current) resetConnection("انقطع اتصال المستخدم 1001. أنشئ ملفًا جديدًا لإعادة الاقتران.")
-                        }
-                    })
-                }.onFailure { status = "تعذّر تشغيل الخادم. تحقق من عنوان Wi‑Fi وأن المنفذ $PORT متاح." }
-                update()
+                    val pin = Wire.pin(keys.entry.certificate.publicKey)
+                    discovery.advertise(pin)
+                    publish(state.value.copy(address = address, pin = pin, busy = false, status = "الخادم يعمل على الشبكة المحلية."))
+                    server.serve(
+                        { connection -> onMain(current) {
+                            channel = connection
+                            publish(state.value.copy(peer = "1001", status = "المستخدم 1001 متصل."))
+                        } },
+                        { message -> onMain(current) { received(message) } },
+                        { onMain(current) { disconnect("المستخدم 1001 غير متصل.") } },
+                    )
+                }.onFailure {
+                    publish(state.value.copy(busy = false, status = "تعذّر تشغيل الخادم. تحقق من عنوان الشبكة والمنفذ."))
+                }
             }
         }
     }
@@ -96,71 +115,126 @@ internal class ConnectionController(private val update: () -> Unit) {
         return bytes
     }
 
-    fun connect(profile: Profile, address: String) {
-        require(privateIpv4(address))
-        if (profile.expires <= System.currentTimeMillis()) {
-            status = "انتهت صلاحية الملف. أنشئ ملفًا جديدًا من الهاتف الأول."
-            update()
-            return
-        }
-        stop()
-        busy = true
-        status = "جارٍ الاتصال والتحقق من البصمة…"
-        update()
-        val current = generation
-        worker.execute {
-            val result = runCatching { LocalClient(address, profile.pin) }
-            val endpoint = result.getOrNull()
-            if (endpoint == null) {
-                main.post {
-                    if (current == generation) {
-                        busy = false
-                        resetConnection("تعذّر إعداد الاتصال المشفّر.")
-                    }
-                }
-                return@execute
-            }
+    fun revoke() {
+        val server = host ?: return
+        sender.execute {
+            val result = runCatching { server.revokeDevice() }
             main.post {
-                if (current == generation) client = endpoint else endpoint.close()
-            }
-            try {
-                val active = endpoint.connect(profile.token)
-                main.post {
-                    if (current == generation) {
-                        busy = false
-                        channel = active
-                        status = "متصل بالخادم · المستخدم 1001"
-                        probe()
-                        heartbeat = object : Runnable {
-                            override fun run() {
-                                if (current != generation || channel == null) return
-                                send(Signal(SignalType.PING, UUID.randomUUID()))
-                                main.postDelayed(this, 10_000)
-                            }
-                        }.also { main.postDelayed(it, 10_000) }
-                        update()
-                    }
-                }
-                while (true) {
-                    val message = active.receive()
-                    main.post { if (current == generation) received(message) }
-                }
-            } catch (failure: Exception) {
-                main.post {
-                    if (current == generation) {
-                        val reason = if (busy) failure.message.orEmpty() else "انقطع اتصال الخادم."
-                        busy = false
-                        resetConnection(reason)
-                    }
-                }
-            } finally {
-                endpoint.close()
+                if (host === server) disconnect(
+                    if (result.isSuccess) "أُلغي اقتران المستخدم 1001." else "تعذّر إلغاء الاقتران."
+                )
             }
         }
     }
 
-    fun dial() {
-        if (!connected) return
+    fun connect(profile: Profile, manual: String?) {
+        require(manual == null || privateIpv4(manual))
+        stop()
+        if (profile.expires <= System.currentTimeMillis()) {
+            publish(SessionState(mode = Mode.CLIENT, status = "انتهت صلاحية الملف. أنشئ ملفًا جديدًا."))
+            return
+        }
+        locate(SavedConnection(manual ?: profile.host, profile.pin, Wire.token()), profile.token, manual != null)
+    }
+
+    fun reconnect(manual: String? = null) {
+        require(manual == null || privateIpv4(manual))
+        stop()
+        publish(SessionState(mode = Mode.CLIENT, busy = true, status = "جارٍ قراءة الاتصال المحفوظ…"))
+        val current = generation
+        worker.execute {
+            val saved = runCatching(store::saved).getOrNull()
+            onMain(current) {
+                if (saved == null) publish(SessionState(mode = Mode.CLIENT, status = "استورد ملف اقتران للاتصال."))
+                else locate(saved.copy(address = manual ?: saved.address), null, manual != null)
+            }
+        }
+    }
+
+    fun forget() {
+        stop()
+        sender.execute { runCatching(store::forget) }
+        publish(SessionState(mode = Mode.CLIENT, status = "حُذف الاتصال المحفوظ من هذا الهاتف."))
+    }
+
+    private fun locate(saved: SavedConnection, token: String?, manual: Boolean) {
+        publish(SessionState(mode = Mode.CLIENT, busy = true, address = saved.address, status = "جارٍ البحث عن الخادم المحلي…"))
+        if (manual) open(saved, token)
+        else {
+            val current = generation
+            discovery.find(saved.pin) { address ->
+                if (current == generation) {
+                    val discovered = address?.takeIf { it != saved.address }
+                    open(saved.copy(address = discovered ?: saved.address), token, saved.takeIf { discovered != null })
+                }
+            }
+        }
+    }
+
+    private fun open(saved: SavedConnection, token: String?, fallback: SavedConnection? = null) {
+        val current = generation
+        publish(state.value.copy(busy = true, address = saved.address, status = "جارٍ التحقق من هوية الخادم…"))
+        worker.execute {
+            var online = false
+            var endpoint: LocalClient? = null
+            try {
+                endpoint = LocalClient(saved.address, saved.pin)
+                val candidate = endpoint
+                main.post {
+                    if (current == generation) client = candidate else candidate.close()
+                }
+                val active = endpoint.connect(token, saved.credential)
+                online = true
+                onMain(current) {
+                    retryCount = 0
+                    channel = active
+                    publish(state.value.copy(
+                        peer = "1000", busy = false,
+                        status = "متصل بالخادم المحلي.",
+                    ))
+                    sender.execute {
+                        if (current == generation && runCatching { store.save(saved) }.isFailure) {
+                            onMain(current) {
+                                if (channel === active) publish(
+                                    state.value.copy(status = "متصل. تعذّر حفظ الاقتران على الهاتف.")
+                                )
+                            }
+                        }
+                    }
+                    probe()
+                    heartbeat = object : Runnable {
+                        override fun run() {
+                            if (current != generation || channel !== active) return
+                            send(Signal(SignalType.PING, UUID.randomUUID()))
+                            main.postDelayed(this, 10_000)
+                        }
+                    }.also { main.postDelayed(it, 10_000) }
+                }
+                while (true) {
+                    val message = active.receive()
+                    onMain(current) { received(message) }
+                }
+            } catch (_: Exception) {
+                val retryConnection = token == null || online
+                onMain(current) {
+                    if (!online && fallback != null) {
+                        open(fallback, token)
+                        return@onMain
+                    }
+                    disconnect(if (online) "انقطع اتصال الخادم." else "تعذّر الاتصال. تحقق من الشبكة والاقتران.")
+                    if (retryConnection && retryCount < RETRY_DELAYS.size) {
+                        val delay = RETRY_DELAYS[retryCount++]
+                        retry = Runnable { locate(saved, null, false) }.also { main.postDelayed(it, delay) }
+                    }
+                }
+            } finally {
+                runCatching { endpoint?.close() }
+            }
+        }
+    }
+
+    fun dial(peer: String) {
+        if (channel == null || state.value.peer != peer) return
         call.dial()?.let(::send)
         changed()
     }
@@ -170,107 +244,177 @@ internal class ConnectionController(private val update: () -> Unit) {
         changed()
     }
 
+    fun startMedia(id: UUID) {
+        if (call.id != id || !call.accepted || voice != null) return
+        val media = VoiceMedia(
+            context,
+            { type, payload -> if (call.id == id && call.accepted) send(Signal(type, id, payload)) },
+            { status -> if (call.id == id) { call.media(status); changed() } },
+            { if (call.id == id) failMedia() },
+        )
+        voice = media
+        call.media(CallState.CONNECTING)
+        changed()
+        try {
+            media.start(call.outgoing)
+            while (pendingMedia.isNotEmpty()) {
+                val signal = pendingMedia.removeFirst()
+                media.receive(signal.type, checkNotNull(signal.payload))
+            }
+        } catch (_: Exception) {
+            failMedia()
+        } catch (_: LinkageError) {
+            failMedia()
+        }
+    }
+
+    fun failMedia() {
+        if (!call.accepted) return
+        call.failed()?.let(::send)
+        changed()
+    }
+
+    fun audioServiceEnded(id: UUID) {
+        if (call.id == id && voice != null) failMedia()
+    }
+
+    fun toggleMute() {
+        val active = voice ?: return
+        val mute = !state.value.muted
+        active.mute(mute)
+        publish(state.value.copy(muted = mute))
+    }
+
     fun probe() {
-        if (!connected) return
+        if (channel == null) return
         val id = UUID.randomUUID()
         waiting = id to SystemClock.elapsedRealtime()
         send(Signal(SignalType.PING, id))
         main.postDelayed({
             if (waiting?.first == id) {
                 waiting = null
-                status = "انتهت مهلة فحص الاتصال."
-                update()
+                publish(state.value.copy(latency = null, status = "انتهت مهلة فحص الاتصال."))
             }
-        }, 5000L)
+        }, 5_000L)
     }
 
     private fun received(message: Signal) {
         when (message.type) {
-            SignalType.PING -> if (!hosting) send(Signal(SignalType.PONG, message.id))
+            SignalType.PING -> send(Signal(SignalType.PONG, message.id))
             SignalType.PONG -> waiting?.takeIf { it.first == message.id }?.let {
-                latency = SystemClock.elapsedRealtime() - it.second
                 waiting = null
+                publish(state.value.copy(latency = SystemClock.elapsedRealtime() - it.second))
             }
-            else -> call.remote(message)?.let(::send)
+            SignalType.OFFER, SignalType.ANSWER, SignalType.ICE -> {
+                if (message.id != call.id || !call.accepted) return
+                if (message.type == SignalType.OFFER && call.outgoing || message.type == SignalType.ANSWER && !call.outgoing) return
+                val media = voice
+                if (media != null) media.receive(message.type, checkNotNull(message.payload))
+                else if (pendingMedia.size < 40) pendingMedia.add(message)
+            }
+            else -> {
+                call.remote(message)?.let(::send)
+                changed()
+            }
         }
-        changed()
     }
 
     private fun changed() {
-        timer?.let(main::removeCallbacks)
-        timer = null
-        update()
-        if (call.state in setOf(CallState.CALLING, CallState.RINGING)) {
-            val id = call.id
-            val incoming = call.state == CallState.RINGING
-            val deadline = deadlines.getOrPut(id) { SystemClock.elapsedRealtime() + if (incoming) 30_000 else 32_000 }
-            timer = Runnable {
-                if (call.id != id) return@Runnable
-                if (incoming) decide(SignalType.TIMEOUT)
-                else {
-                    call.remote(Signal(SignalType.TIMEOUT, checkNotNull(id)))
-                    changed()
-                }
-            }.also { main.postDelayed(it, (deadline - SystemClock.elapsedRealtime()).coerceAtLeast(0)) }
+        val id = call.id
+        val next = call.state
+        if (id == null) {
+            voice?.close()
+            voice = null
+            pendingMedia.clear()
+            val completed = trackedId
+            val peer = state.value.peer
+            if (completed != null && peer != null) {
+                val item = CallHistory(completed.toString(), peer, next.name, System.currentTimeMillis())
+                sender.execute { runCatching { store.record(item) } }
+            }
         }
-        deadlines.keys.retainAll(setOf(call.id).takeIf { call.state in setOf(CallState.CALLING, CallState.RINGING) }.orEmpty())
+        if (id != trackedId || next != trackedState) {
+            timer?.let(main::removeCallbacks)
+            timer = null
+            if (id != null) {
+                val delay = when (next) {
+                    CallState.CALLING -> 32_000L
+                    CallState.RINGING -> 30_000L
+                    CallState.ACCEPTED, CallState.CONNECTING -> 30_000L
+                    CallState.RECONNECTING -> 8_000L
+                    else -> null
+                }
+                if (delay != null) timer = Runnable {
+                    if (call.id != id || call.state != next) return@Runnable
+                    when (next) {
+                        CallState.RINGING -> decide(SignalType.TIMEOUT)
+                        CallState.CALLING -> {
+                            call.remote(Signal(SignalType.TIMEOUT, id))
+                            changed()
+                        }
+                        else -> failMedia()
+                    }
+                }.also { main.postDelayed(it, delay) }
+            }
+            trackedId = id
+            trackedState = next
+        }
+        publish(state.value.copy(callId = id, callState = next, muted = id != null && state.value.muted))
     }
-
-    private val deadlines = mutableMapOf<UUID?, Long>()
-    private val sender = Executors.newSingleThreadExecutor()
 
     private fun send(message: Signal) {
         val active = channel ?: return
-        val current = generation
         sender.execute {
             try {
                 active.send(message)
             } catch (_: Exception) {
-                main.post {
-                    if (generation == current && channel === active) {
-                        runCatching { active.close() }
-                        resetConnection("تعذّر إرسال الرسالة. أعد الاقتران.")
-                    }
-                }
+                runCatching { active.close() }
             }
         }
     }
 
-    private fun resetConnection(reason: String) {
+    private fun disconnect(reason: String) {
         channel = null
         waiting = null
-        latency = null
         heartbeat?.let(main::removeCallbacks)
         heartbeat = null
         call.disconnected()
-        status = reason
         changed()
+        publish(state.value.copy(peer = null, latency = null, busy = false, status = reason))
     }
 
     fun stop() {
         generation++
+        retry?.let(main::removeCallbacks)
+        retry = null
+        retryCount = 0
+        discovery.close()
         val oldClient = client
-        val oldHost = host
         client = null
         host = null
         identity = null
-        pin = null
-        busy = false
-        resetConnection("")
-        if (oldClient != null || oldHost != null) {
-            sender.execute {
-                runCatching { oldClient?.close() }
-                runCatching { oldHost?.close() }
-            }
+        hostAddress = null
+        disconnect("")
+        call = LocalCall()
+        publish(SessionState())
+        runCatching { oldClient?.close() }
+        hostControl.execute {
+            runCatching { boundHost?.close() }
+            boundHost = null
         }
     }
 
-    fun close() {
-        stop()
-        main.removeCallbacksAndMessages(null)
-        worker.shutdown()
-        sender.shutdown()
+    private fun publish(snapshot: SessionState) {
+        mutable.value = snapshot
+        onUpdate?.invoke(snapshot)
     }
 
-    private fun String.startsWithAny(vararg prefixes: String): Boolean = prefixes.any { startsWith(it) }
+    private fun onMain(current: Int, action: () -> Unit) {
+        main.post { if (current == generation) action() }
+    }
+
+    private companion object {
+        val LAN_INTERFACES = listOf("wlan", "swlan", "ap", "softap", "eth", "en", "p2p")
+        val RETRY_DELAYS = listOf(2_000L, 4_000L, 8_000L)
+    }
 }

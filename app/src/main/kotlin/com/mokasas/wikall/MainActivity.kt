@@ -1,317 +1,406 @@
 package com.mokasas.wikall
 
-import android.app.Activity
-import android.app.AlertDialog
+import android.Manifest
+import android.content.ClipData
 import android.content.Intent
-import android.graphics.Color
-import android.graphics.Typeface
-import android.graphics.drawable.GradientDrawable
-import android.media.Ringtone
-import android.media.RingtoneManager
+import android.content.pm.PackageManager
 import android.net.Uri
+import android.os.Build
 import android.os.Bundle
-import android.os.VibrationEffect
-import android.os.Vibrator
-import android.text.InputType
-import android.view.View
-import android.widget.Button
-import android.widget.EditText
-import android.widget.LinearLayout
-import android.widget.ScrollView
-import android.widget.TextView
-import android.widget.Toast
+import androidx.activity.ComponentActivity
+import androidx.activity.enableEdgeToEdge
+import androidx.activity.compose.BackHandler
+import androidx.activity.compose.setContent
+import androidx.activity.result.contract.ActivityResultContracts
+import androidx.compose.foundation.layout.Arrangement
+import androidx.compose.foundation.layout.Column
+import androidx.compose.foundation.layout.fillMaxSize
+import androidx.compose.foundation.layout.fillMaxWidth
+import androidx.compose.foundation.layout.padding
+import androidx.compose.foundation.layout.safeDrawingPadding
+import androidx.compose.foundation.rememberScrollState
+import androidx.compose.foundation.verticalScroll
+import androidx.compose.material3.AlertDialog
+import androidx.compose.material3.Button
+import androidx.compose.material3.MaterialTheme
+import androidx.compose.material3.OutlinedButton
+import androidx.compose.material3.OutlinedTextField
+import androidx.compose.material3.Surface
+import androidx.compose.material3.Text
+import androidx.compose.material3.darkColorScheme
+import androidx.compose.runtime.Composable
+import androidx.compose.runtime.CompositionLocalProvider
+import androidx.compose.runtime.LaunchedEffect
+import androidx.compose.runtime.collectAsState
+import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableStateOf
+import androidx.compose.runtime.remember
+import androidx.compose.runtime.setValue
+import androidx.compose.ui.Modifier
+import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.platform.LocalLayoutDirection
+import androidx.compose.ui.text.TextStyle
+import androidx.compose.ui.text.style.TextDirection
+import androidx.compose.ui.unit.LayoutDirection
+import androidx.compose.ui.unit.dp
+import androidx.lifecycle.lifecycleScope
+import dagger.hilt.android.AndroidEntryPoint
+import java.util.UUID
+import javax.inject.Inject
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.launch
+import kotlinx.coroutines.withContext
 
-class MainActivity : Activity() {
-    private enum class Mode { HOME, SERVER, CLIENT }
-    private var mode = Mode.HOME
-    private lateinit var controller: ConnectionController
-    private lateinit var content: LinearLayout
-    private var profile: Profile? = null
-    private var exportedUri: Uri? = null
-    private var foreground = false
-    private var ringtone: Ringtone? = null
-    private var ringing = false
-    private var message = ""
-    private val backgroundColor = Color.rgb(16, 24, 32)
-    private val panel = Color.rgb(28, 43, 53)
-    private val green = Color.rgb(93, 236, 194)
-    private val ink = Color.rgb(239, 246, 247)
-    private val muted = Color.rgb(178, 198, 205)
-    private val vibrator: Vibrator? get() = getSystemService(Vibrator::class.java)
+@AndroidEntryPoint
+class MainActivity : ComponentActivity() {
+    @Inject internal lateinit var controller: ConnectionController
+    private var selectedMode by mutableStateOf(Mode.HOME)
+    private var imported by mutableStateOf<Profile?>(null)
+    private var exported by mutableStateOf<Uri?>(null)
+    private var note by mutableStateOf("")
+    private var resumed by mutableStateOf(false)
+    private var attemptedAudio: UUID? = null
+    private var microphoneAction: (() -> Unit)? = null
+
+    private val microphone = registerForActivityResult(ActivityResultContracts.RequestPermission()) { allowed ->
+        val action = microphoneAction
+        microphoneAction = null
+        if (allowed) action?.invoke() else note = "اسمح بالميكروفون لإجراء المكالمات الصوتية."
+    }
+    private val notifications = registerForActivityResult(ActivityResultContracts.RequestPermission()) { granted ->
+        if (!granted) note = "يمكنك تفعيل إشعارات Wi-Call من إعدادات الهاتف لاستقبال تنبيه المكالمات في الخلفية."
+    }
+    private val openProfile = registerForActivityResult(ActivityResultContracts.OpenDocument()) { uri ->
+        uri?.let(::import)
+    }
+    private val saveProfile = registerForActivityResult(ActivityResultContracts.CreateDocument(PROFILE_MIME)) { uri ->
+        if (uri != null) {
+            lifecycleScope.launch {
+                val result = runCatching {
+                    val bytes = controller.export()
+                    withContext(Dispatchers.IO) {
+                        checkNotNull(contentResolver.openOutputStream(uri, "wt")).use { it.write(bytes) }
+                    }
+                }
+                if (result.isSuccess) {
+                    exported = uri
+                    note = "شارك الملف خلال خمس دقائق."
+                } else note = "تعذّر إنشاء الملف. تحقق من تشغيل الخادم."
+            }
+        }
+    }
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
-        controller = ConnectionController(::render)
-        val scroller = ScrollView(this).apply { isFillViewport = true; setBackgroundColor(backgroundColor) }
-        content = LinearLayout(this).apply {
-            orientation = LinearLayout.VERTICAL
-            layoutDirection = View.LAYOUT_DIRECTION_RTL
-            setPadding(dp(22), dp(28), dp(22), dp(22))
-        }
-        scroller.addView(content)
-        setContentView(scroller)
-        if (intent.action == Intent.ACTION_VIEW) intent.data?.let(::import) else render()
-    }
-
-    override fun onStart() {
-        super.onStart()
-        foreground = true
-        render()
-    }
-
-    override fun onStop() {
-        foreground = false
-        ring(false)
-        super.onStop()
-    }
-
-    override fun onDestroy() {
-        if (::controller.isInitialized) controller.close()
-        ring(false)
-        super.onDestroy()
-    }
-
-    @Deprecated("Android Activity back callback")
-    override fun onBackPressed() {
-        if (mode == Mode.HOME) super.onBackPressed() else home()
-    }
-
-    private fun home() {
-        mode = Mode.HOME
-        controller.stop()
-        message = ""
-        profile = null
-        exportedUri = null
-        render()
-    }
-
-    private fun render() {
-        if (!::content.isInitialized) return
-        ring(foreground && controller.callState == CallState.RINGING)
-        content.removeAllViews()
-        text("WiKall", 36, green, true)
-        text("MokAsas Local Voice", 17, ink)
-        when (mode) {
-            Mode.HOME -> {
-                paragraph("اتصال محلي بين هاتفين", "وصّل الهاتفين بشبكة Wi‑Fi واحدة أو بنقطة اتصال الهاتف الأول.")
-                button("تشغيل كخادم · 1000") { mode = Mode.SERVER; render() }
-                button("استخدام ملف تعريف · 1001", secondary = true) { mode = Mode.CLIENT; render() }
-                text("إصدار اختبار الاتصال والدعوات", 14, muted)
-            }
-            Mode.SERVER -> {
-                paragraph("الخادم المحلي · 1000", controller.status.ifBlank { "شغّل الخادم من الهاتف الأول." })
-                if (controller.hosting) {
-                    controller.pin?.let { text("بصمة الخادم (SHA‑256)\n${groupPin(it)}", 13, muted, ltr = true) }
-                    button("إنشاء وحفظ .mokprofile") { createProfile() }
-                    exportedUri?.let { uri -> button("مشاركة الملف المحفوظ", secondary = true) { share(uri) } }
-                    button("إيقاف الخادم", secondary = true) { controller.stop(); exportedUri = null; message = ""; render() }
-                } else if (!controller.busy) {
-                    button("تشغيل الخادم") { chooseAddress() }
-                }
-                session("1001")
-            }
-            Mode.CLIENT -> {
-                paragraph("العميل المحلي · 1001", controller.status.ifBlank { "استورد الملف الذي أنشأه الهاتف الأول." })
-                if (!controller.connected && !controller.busy) {
-                    button("استيراد .mokprofile") {
-                        @Suppress("DEPRECATION")
-                        startActivityForResult(Intent(Intent.ACTION_OPEN_DOCUMENT).apply {
-                            addCategory(Intent.CATEGORY_OPENABLE)
-                            type = "*/*"
-                        }, IMPORT)
+        enableEdgeToEdge()
+        selectedMode = savedInstanceState?.getString("mode")?.let(Mode::valueOf) ?: Mode.HOME
+        setContent {
+            CompositionLocalProvider(LocalLayoutDirection provides LayoutDirection.Rtl) {
+                MaterialTheme(colorScheme = darkColorScheme(
+                    primary = Color(0xFF5DECC2), onPrimary = Color(0xFF102020),
+                    background = Color(0xFF101820), surface = Color(0xFF1C2B35),
+                )) {
+                    val session by controller.state.collectAsState()
+                    LaunchedEffect(session.peer, session.mode) {
+                        if (session.mode == Mode.CLIENT && session.peer != null) imported = null
                     }
-                    profile?.let { file ->
-                        text("عنوان الخادم  ${file.host}:$PORT", 15, muted, ltr = true)
-                        button("تحقق من البصمة واتصل") { approve(file, file.host) }
-                        button("استخدام عنوان IP يدويًا", secondary = true) {
-                            input("عنوان IP للخادم", file.host) { address ->
-                                if (privateIpv4(address)) approve(file, address)
-                                else note("أدخل عنوان IPv4 محليًا صالحًا.")
+                    LaunchedEffect(session.callId, session.callState, resumed) {
+                        val incoming = session.callState == CallState.RINGING
+                        setShowWhenLocked(incoming || session.callId != null)
+                        setTurnScreenOn(incoming)
+                        val call = session.callId
+                        if (resumed && call != null && session.callState == CallState.ACCEPTED &&
+                            attemptedAudio != call && hasMicrophone()) startAudio(call)
+                    }
+                    Surface(Modifier.fillMaxSize(), color = MaterialTheme.colorScheme.background) {
+                        Screen(session)
+                    }
+                }
+            }
+        }
+        if (savedInstanceState == null) handleIntent(intent)
+    }
+
+    override fun onSaveInstanceState(outState: Bundle) {
+        outState.putString("mode", selectedMode.name)
+        super.onSaveInstanceState(outState)
+    }
+
+    override fun onNewIntent(intent: Intent) {
+        super.onNewIntent(intent)
+        setIntent(intent)
+        handleIntent(intent)
+    }
+
+    override fun onResume() {
+        super.onResume()
+        resumed = true
+    }
+
+    override fun onPause() {
+        resumed = false
+        super.onPause()
+    }
+
+    @Composable
+    private fun Screen(session: SessionState) {
+        val mode = session.mode.takeUnless { it == Mode.HOME } ?: selectedMode
+        var addressChoices by remember { mutableStateOf<List<String>?>(null) }
+        var manualAction by remember { mutableStateOf<((String) -> Unit)?>(null) }
+        var addressInput by remember { mutableStateOf("") }
+        var fingerprint by remember { mutableStateOf<Pair<Profile, String?>?>(null) }
+        var revoke by remember { mutableStateOf(false) }
+        BackHandler(mode != Mode.HOME) {
+            if (session.mode == Mode.HOME) selectedMode = Mode.HOME else moveTaskToBack(true)
+        }
+        Column(
+            Modifier.safeDrawingPadding().fillMaxSize().verticalScroll(rememberScrollState()).padding(22.dp),
+            verticalArrangement = Arrangement.spacedBy(12.dp),
+        ) {
+            Text(getString(R.string.app_name), style = MaterialTheme.typography.headlineLarge, color = MaterialTheme.colorScheme.primary)
+            when (mode) {
+                Mode.HOME -> {
+                    Text("مكالمات محلية عبر Wi-Fi أو نقطة الاتصال")
+                    Action("وضع الخادم · 1000") { selectedMode = Mode.SERVER }
+                    Action("وضع العميل · 1001", true) { selectedMode = Mode.CLIENT }
+                }
+                Mode.SERVER -> {
+                    Text("الخادم المحلي · 1000", style = MaterialTheme.typography.titleLarge)
+                    if (session.address != null) {
+                        Text("${session.address}:$PORT", style = TextStyle(textDirection = TextDirection.Ltr))
+                        session.pin?.let { Text("بصمة الخادم SHA-256\n${groupPin(it)}") }
+                        Action("إنشاء ملف .mokprofile") { saveProfile.launch("Wi-Call-1001.mokprofile") }
+                        exported?.let { uri -> Action("مشاركة الملف", true) { share(uri) } }
+                        Action("إلغاء اقتران العميل", true) { revoke = true }
+                    } else if (!session.busy) {
+                        Action("تشغيل الخادم") {
+                            val addresses = runCatching(controller::listAddresses).getOrDefault(emptyList())
+                            when (addresses.size) {
+                                0 -> {
+                                    addressInput = ""
+                                    manualAction = { runSession { controller.start(it) } }
+                                }
+                                1 -> runSession { controller.start(addresses.single()) }
+                                else -> addressChoices = addresses
                             }
                         }
                     }
                 }
-                if (controller.connected) button("قطع الاتصال", secondary = true) { controller.stop() }
-                session("1000")
+                Mode.CLIENT -> {
+                    Text("العميل المحلي · 1001", style = MaterialTheme.typography.titleLarge)
+                    if (session.peer == null && !session.busy) {
+                        Action("إعادة الاتصال بالاقتران المحفوظ") { runSession { controller.reconnect() } }
+                        Action("استيراد .mokprofile", true) { openProfile.launch(arrayOf("*/*")) }
+                        imported?.let { file ->
+                            Action("التحقق من البصمة والاتصال") { fingerprint = file to null }
+                        }
+                        Action("عنوان IP يدوي", true) {
+                            addressInput = imported?.host ?: session.address.orEmpty()
+                            manualAction = { address ->
+                                val file = imported
+                                if (file == null) runSession { controller.reconnect(address) }
+                                else fingerprint = file to address
+                            }
+                        }
+                        Action("نسيان الاتصال المحفوظ", true) { controller.forget(); imported = null }
+                    }
+                }
             }
+            if (session.status.isNotBlank()) Text(session.status)
+            if (session.busy) Action("إلغاء الاتصال", true, ::leave)
+            session.peer?.let { peer -> CallPane(session, peer) }
+            if (note.isNotBlank()) Text(note)
+            if (mode != Mode.HOME) Action("العودة لاختيار الوضع", true, ::leave)
         }
-        if (message.isNotBlank()) text(message, 15, green)
-        if (mode != Mode.HOME) button("العودة لاختيار الوضع", secondary = true) { home() }
+
+        addressChoices?.let { items ->
+            AlertDialog(
+                onDismissRequest = { addressChoices = null },
+                title = { Text("اختر عنوان الشبكة المحلية") },
+                text = { Column {
+                    items.forEach { address ->
+                        Action(address, true) {
+                            addressChoices = null
+                            runSession { controller.start(address) }
+                        }
+                    }
+                } },
+                confirmButton = { Action("إلغاء", true) { addressChoices = null } },
+            )
+        }
+        manualAction?.let { connect ->
+            AlertDialog(
+                onDismissRequest = { manualAction = null },
+                title = { Text("عنوان IPv4 محلي") },
+                text = { OutlinedTextField(addressInput, { addressInput = it }, singleLine = true) },
+                confirmButton = {
+                    Button(enabled = privateIpv4(addressInput.trim()), onClick = {
+                        manualAction = null
+                        connect(addressInput.trim())
+                    }) { Text("متابعة") }
+                },
+                dismissButton = { Action("إلغاء", true) { manualAction = null } },
+            )
+        }
+        fingerprint?.let { (file, address) ->
+            AlertDialog(
+                onDismissRequest = { fingerprint = null },
+                title = { Text("تحقق من هوية الخادم") },
+                text = { Text("قارن البصمة كاملة مع شاشة الخادم.\n\n${groupPin(file.pin)}") },
+                confirmButton = { Action("البصمة مطابقة") {
+                    fingerprint = null
+                    runSession { controller.connect(file, address) }
+                } },
+                dismissButton = { Action("إلغاء", true) { fingerprint = null } },
+            )
+        }
+        if (revoke) {
+            AlertDialog(
+                onDismissRequest = { revoke = false },
+                title = { Text("إلغاء اقتران المستخدم 1001") },
+                text = { Text("سيحتاج الهاتف الثاني إلى ملف اقتران جديد.") },
+                confirmButton = { Action("إلغاء الاقتران") { revoke = false; controller.revoke() } },
+                dismissButton = { Action("رجوع", true) { revoke = false } },
+            )
+        }
     }
 
-    private fun session(peer: String) {
-        if (!controller.connected) return
-        controller.latency?.let { paragraph("نجح فحص الاتصال", "زمن الذهاب والإياب: $it مللي ثانية.") }
-        when (controller.callState) {
-            CallState.IDLE -> Unit
-            CallState.CALLING -> paragraph("جارٍ إرسال الدعوة", "انتظر رد المستخدم $peer.")
-            CallState.RINGING -> {
-                paragraph("مكالمة اختبار واردة", "المتصل $peer")
-                button("قبول") { controller.decide(SignalType.ACCEPT) }
-                button("رفض", secondary = true) { controller.decide(SignalType.REJECT) }
+    @Composable
+    private fun CallPane(session: SessionState, peer: String) {
+        Text("المستخدم $peer متصل", style = MaterialTheme.typography.titleMedium)
+        val status = when (session.callState) {
+            CallState.IDLE -> ""
+            CallState.CALLING -> "جارٍ الاتصال بالمستخدم $peer"
+            CallState.RINGING -> "مكالمة واردة من $peer"
+            CallState.ACCEPTED -> "قُبلت المكالمة. جارٍ بدء الصوت."
+            CallState.CONNECTING -> "جارٍ إنشاء اتصال الصوت"
+            CallState.CONNECTED -> "المكالمة الصوتية متصلة"
+            CallState.RECONNECTING -> "جارٍ استعادة اتصال الصوت"
+            CallState.FAILED -> "تعذّر اتصال الصوت"
+            CallState.REJECTED -> "رُفضت المكالمة"
+            CallState.MISSED -> "انتهت مهلة الإجابة"
+            CallState.BUSY -> "المستخدم مشغول"
+            CallState.ENDED -> "انتهت المكالمة"
+        }
+        if (status.isNotEmpty()) Text(status)
+        val id = session.callId
+        if (session.callState == CallState.RINGING) {
+            Action("قبول") {
+                withMicrophone {
+                    val current = controller.state.value
+                    if (current.callId == id && current.callState == CallState.RINGING) controller.decide(SignalType.ACCEPT)
+                }
             }
-            CallState.ACCEPTED -> paragraph("تم قبول الدعوة", "نجح اختبار الإشارات بين الهاتفين.")
-            CallState.REJECTED -> paragraph("رُفضت الدعوة", "يمكنك إعادة الاختبار.")
-            CallState.MISSED -> paragraph("انتهت مهلة الدعوة", "لم يُجب الطرف الآخر خلال المهلة.")
-            CallState.BUSY -> paragraph("الطرف الآخر مشغول", "جرّب بعد انتهاء الدعوة الحالية.")
-            CallState.ENDED -> paragraph("انتهت الدعوة", "يمكنك بدء دعوة جديدة.")
-        }
-        if (controller.hasCall && controller.callState != CallState.RINGING) {
-            button("إنهاء الدعوة", secondary = true) { controller.decide(SignalType.END) }
-        }
-        if (!controller.hasCall) button("إرسال دعوة إلى $peer") { controller.dial() }
-        button("افحص الاتصال", secondary = true) { message = ""; controller.probe(); render() }
-    }
-
-    private fun chooseAddress() {
-        val addresses = runCatching(controller::listAddresses).getOrDefault(emptyList())
-        when (addresses.size) {
-            0 -> input("أدخل عنوان الهاتف على الشبكة المحلية", "") { address ->
-                if (privateIpv4(address)) controller.start(address)
-                else note("لم يظهر عنوان Wi‑Fi. وصّل الهاتف بالشبكة أو شغّل نقطة الاتصال.")
+            Action("رفض", true) { controller.decide(SignalType.REJECT) }
+        } else if (id != null) {
+            if (session.callState == CallState.ACCEPTED) {
+                Action("تشغيل الصوت") { withMicrophone { startAudio(id) } }
             }
-            1 -> controller.start(addresses.single())
-            else -> AlertDialog.Builder(this).setTitle("اختر عنوان Wi‑Fi أو نقطة الاتصال")
-                .setItems(addresses.toTypedArray()) { _, index -> controller.start(addresses[index]) }.show()
+            if (session.callState == CallState.CONNECTED) {
+                Action(if (session.muted) "إلغاء كتم الميكروفون" else "كتم الميكروفون", true, controller::toggleMute)
+            }
+            Action("إنهاء المكالمة", true) { controller.decide(SignalType.END) }
+        } else Action("اتصل بـ $peer") { withMicrophone { controller.dial(peer) } }
+        Action("افحص الاتصال", true, controller::probe)
+        session.latency?.let { Text("زمن الذهاب والإياب $it مللي ثانية") }
+    }
+
+    @Composable
+    private fun Action(label: String, secondary: Boolean = false, action: () -> Unit) {
+        if (secondary) OutlinedButton(action, Modifier.fillMaxWidth()) { Text(label) }
+        else Button(action, Modifier.fillMaxWidth()) { Text(label) }
+    }
+
+    private fun withMicrophone(action: () -> Unit) {
+        if (hasMicrophone()) action()
+        else {
+            microphoneAction = action
+            microphone.launch(Manifest.permission.RECORD_AUDIO)
         }
     }
 
-    private fun approve(file: Profile, address: String) {
-        AlertDialog.Builder(this)
-            .setTitle("تحقق من هوية الخادم")
-            .setMessage("قارن البصمة كاملة مع البصمة المعروضة على الهاتف الأول.\n\n${groupPin(file.pin)}")
-            .setPositiveButton("البصمة مطابقة · اتصل") { _, _ -> message = ""; controller.connect(file, address) }
-            .setNegativeButton("إلغاء", null)
-            .show()
+    private fun hasMicrophone() = checkSelfPermission(Manifest.permission.RECORD_AUDIO) == PackageManager.PERMISSION_GRANTED
+
+    private fun startAudio(id: UUID) {
+        if (!resumed || !hasMicrophone() || controller.state.value.callId != id ||
+            controller.state.value.callState != CallState.ACCEPTED) return
+        attemptedAudio = id
+        runCatching {
+            startForegroundService(Intent(this, CallSessionService::class.java).putExtra(CALL_ID, id.toString()))
+        }.onFailure { note = "تعذّر تشغيل الصوت. أعد المحاولة والتطبيق مفتوح." }
     }
 
-    private fun createProfile() {
-        @Suppress("DEPRECATION")
-        startActivityForResult(Intent(Intent.ACTION_CREATE_DOCUMENT).apply {
-            addCategory(Intent.CATEGORY_OPENABLE)
-            type = MIME
-            putExtra(Intent.EXTRA_TITLE, "MokAsas-1001.mokprofile")
-        }, EXPORT)
-    }
-
-    @Deprecated("Activity result callback retained for Android 10 compatibility")
-    override fun onActivityResult(request: Int, result: Int, data: Intent?) {
-        super.onActivityResult(request, result, data)
-        val uri = data?.data ?: return
-        if (result != RESULT_OK) return
-        when (request) {
-            IMPORT -> import(uri)
-            EXPORT -> runCatching {
-                val bytes = controller.export()
-                requireNotNull(contentResolver.openOutputStream(uri, "wt")).use { it.write(bytes) }
-                exportedUri = uri
-                note("حُفظ الملف. شاركه مع الهاتف الثاني خلال خمس دقائق.")
-            }.onFailure { note("تعذّر حفظ الملف. تحقق من تشغيل الخادم وأعد المحاولة.") }
+    private fun runSession(action: () -> Unit) {
+        note = ""
+        runCatching {
+            startForegroundService(Intent(this, LocalServerForegroundService::class.java))
+            action()
+        }.onFailure { note = "تعذّر بدء خدمة الاتصال المحلي." }
+        if (Build.VERSION.SDK_INT >= 33 &&
+            checkSelfPermission(Manifest.permission.POST_NOTIFICATIONS) != PackageManager.PERMISSION_GRANTED &&
+            !getPreferences(MODE_PRIVATE).getBoolean("notificationAsked", false)) {
+            getPreferences(MODE_PRIVATE).edit().putBoolean("notificationAsked", true).apply()
+            notifications.launch(Manifest.permission.POST_NOTIFICATIONS)
         }
+    }
+
+    private fun leave() {
+        controller.stop()
+        stopService(Intent(this, LocalServerForegroundService::class.java))
+        selectedMode = Mode.HOME
+        note = ""
+        exported = null
+        imported = null
+    }
+
+    @Suppress("DEPRECATION")
+    private fun handleIntent(intent: Intent) {
+        val uri = when (intent.action) {
+            Intent.ACTION_VIEW -> intent.data
+            Intent.ACTION_SEND -> if (Build.VERSION.SDK_INT >= 33) intent.getParcelableExtra(Intent.EXTRA_STREAM, Uri::class.java)
+                else intent.getParcelableExtra(Intent.EXTRA_STREAM)
+            else -> null
+        }
+        uri?.let(::import)
     }
 
     private fun import(uri: Uri) {
         if (uri.scheme != "content") return
-        mode = Mode.CLIENT
-        controller.stop()
-        profile = null
-        runCatching {
-            val bytes = requireNotNull(contentResolver.openInputStream(uri)).use { stream ->
-                val buffer = ByteArray(Profile.MAX_SIZE + 1)
-                var size = 0
-                while (size < buffer.size) {
-                    val chunk = stream.read(buffer, size, buffer.size - size)
-                    if (chunk <= 0) break
-                    size += chunk
-                }
-                buffer.copyOf(size)
+        selectedMode = Mode.CLIENT
+        lifecycleScope.launch {
+            val file = withContext(Dispatchers.IO) {
+                runCatching {
+                    val bytes = checkNotNull(contentResolver.openInputStream(uri)).use { stream ->
+                        val buffer = ByteArray(Profile.MAX_SIZE + 1)
+                        var size = 0
+                        while (size < buffer.size) {
+                            val read = stream.read(buffer, size, buffer.size - size)
+                            if (read <= 0) break
+                            size += read
+                        }
+                        buffer.copyOf(size)
+                    }
+                    Profile.read(bytes)
+                }.getOrNull()
             }
-            profile = Profile.read(bytes)
-            note("الملف سليم. طابق بصمة الخادم للاتصال.")
-        }.onFailure { note("ملف غير صالح أو معدّل أو منتهي الصلاحية.") }
+            imported = file
+            note = if (file != null) "طابق بصمة الخادم للاتصال." else "ملف اقتران غير صالح أو منتهي الصلاحية."
+        }
     }
 
     private fun share(uri: Uri) {
-        val intent = Intent(Intent.ACTION_SEND).apply {
-            type = MIME
+        val send = Intent(Intent.ACTION_SEND).apply {
+            type = PROFILE_MIME
             putExtra(Intent.EXTRA_STREAM, uri)
-            clipData = android.content.ClipData.newRawUri("MokAsas", uri)
+            clipData = ClipData.newRawUri("Wi-Call", uri)
             addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
         }
-        runCatching { startActivity(Intent.createChooser(intent, "مشاركة ملف الاتصال")) }
-            .onFailure { Toast.makeText(this, "شارك الملف من تطبيق الملفات.", Toast.LENGTH_SHORT).show() }
+        startActivity(Intent.createChooser(send, "مشاركة ملف الاتصال"))
     }
 
-    private fun ring(active: Boolean) {
-        if (ringing == active) return
-        ringing = active
-        if (active) {
-            runCatching {
-                ringtone = RingtoneManager.getRingtone(this, RingtoneManager.getDefaultUri(RingtoneManager.TYPE_RINGTONE))
-                ringtone?.isLooping = true
-                ringtone?.play()
-            }
-            runCatching { vibrator?.vibrate(VibrationEffect.createWaveform(longArrayOf(0, 450, 600), 0)) }
-        } else {
-            ringtone?.stop()
-            ringtone = null
-            vibrator?.cancel()
-        }
-    }
+    private fun groupPin(pin: String) = pin.chunked(4).chunked(4).joinToString("\n") { it.joinToString(" ") }
 
-    private fun input(title: String, initial: String, onAccept: (String) -> Unit) {
-        val field = EditText(this).apply {
-            inputType = InputType.TYPE_CLASS_PHONE
-            textDirection = View.TEXT_DIRECTION_LTR
-            setSingleLine()
-            setText(initial)
-        }
-        AlertDialog.Builder(this).setTitle(title).setView(field)
-            .setPositiveButton("متابعة") { _, _ -> onAccept(field.text.toString().trim()) }
-            .setNegativeButton("إلغاء", null).show()
-    }
-
-    private fun paragraph(title: String, description: String) {
-        text(title, 21, ink, true)
-        text(description, 16, muted)
-    }
-
-    private fun text(value: String, size: Int, color: Int, bold: Boolean = false, ltr: Boolean = false) {
-        content.addView(TextView(this).apply {
-            text = value
-            textSize = size.toFloat()
-            setTextColor(color)
-            setPadding(dp(2), dp(5), dp(2), dp(8))
-            if (bold) setTypeface(typeface, Typeface.BOLD)
-            if (ltr) textDirection = View.TEXT_DIRECTION_LTR
-        })
-    }
-
-    private fun button(label: String, secondary: Boolean = false, action: () -> Unit) {
-        val shape = GradientDrawable().apply {
-            cornerRadius = dp(16).toFloat()
-            setColor(if (secondary) panel else green)
-        }
-        val button = Button(this).apply {
-            text = label
-            textSize = 16f
-            isAllCaps = false
-            setTextColor(if (secondary) ink else backgroundColor)
-            background = shape
-            backgroundTintList = null
-            setPadding(dp(14), dp(8), dp(14), dp(8))
-            setOnClickListener { action() }
-        }
-        content.addView(button, LinearLayout.LayoutParams(-1, -2).apply { setMargins(0, dp(6), 0, dp(6)) })
-    }
-
-    private fun note(text: String) { message = text; render() }
-    private fun groupPin(pin: String): String = pin.chunked(4).chunked(4).joinToString("\n") { it.joinToString(" ") }
-    private fun dp(value: Int) = (value * resources.displayMetrics.density).toInt()
-
-    companion object {
-        private const val MIME = "application/vnd.mokasas.profile"
-        private const val IMPORT = 100
-        private const val EXPORT = 101
+    private companion object {
+        const val PROFILE_MIME = "application/vnd.mokasas.profile"
     }
 }

@@ -2,18 +2,24 @@ package com.mokasas.wikall
 
 import java.util.UUID
 
-internal enum class CallState { IDLE, CALLING, RINGING, ACCEPTED, REJECTED, MISSED, BUSY, ENDED }
+internal enum class CallState { IDLE, CALLING, RINGING, ACCEPTED, CONNECTING, CONNECTED, RECONNECTING, FAILED, REJECTED, MISSED, BUSY, ENDED }
 
-internal class TestCall {
+internal class LocalCall {
     var id: UUID? = null
         private set
     var state: CallState = CallState.IDLE
         private set
+    var outgoing = false
+        private set
+    val accepted: Boolean
+        get() = state == CallState.ACCEPTED || state == CallState.CONNECTING ||
+            state == CallState.CONNECTED || state == CallState.RECONNECTING
     private val recent = LinkedHashSet<UUID>()
 
     fun dial(): Signal? {
         if (id != null) return null
         val next = UUID.randomUUID()
+        outgoing = true
         id = next
         state = CallState.CALLING
         return Signal(SignalType.INVITE, next)
@@ -26,6 +32,7 @@ internal class TestCall {
                 remember(message.id)
                 return Signal(SignalType.BUSY, message.id)
             }
+            outgoing = false
             id = message.id
             state = CallState.RINGING
             return null
@@ -53,6 +60,17 @@ internal class TestCall {
             else -> return null
         }
         return Signal(type, active)
+    }
+
+    fun media(next: CallState) {
+        if (!accepted) return
+        state = next
+    }
+
+    fun failed(): Signal? {
+        val active = id ?: return null
+        complete(CallState.FAILED)
+        return Signal(SignalType.END, active)
     }
 
     fun disconnected() {
