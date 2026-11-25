@@ -1,4 +1,4 @@
-# WiKall · MokAsas Local Voice
+# Wi-Call · MokAsas Local Voice
 
 تطبيق Android أصلي بواجهة عربية، مع وضع خادم محلي ووضع عميل في APK واحد. الإصدار 0.1.0 يختبر الاتصال المشفّر وإشارات الدعوة بين هاتفين. يدعم Android 10 فأحدث.
 

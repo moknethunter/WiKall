@@ -89,7 +89,7 @@ class MainActivity : Activity() {
         if (!::content.isInitialized) return
         ring(foreground && controller.callState == CallState.RINGING)
         content.removeAllViews()
-        text("WiKall", 36, green, true)
+        text(getString(R.string.app_name), 36, green, true)
         text("MokAsas Local Voice", 17, ink)
         when (mode) {
             Mode.HOME -> {

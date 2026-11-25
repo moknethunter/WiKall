@@ -1,1 +1,1 @@
-rootProject.name = "WiKall"
+rootProject.name = "Wi-Call"
