@@ -27,10 +27,10 @@ internal class LanDiscovery(context: Context) {
         }
         registration = listener
         val info = NsdServiceInfo().apply {
-            serviceName = "Wi-Call ${pin.take(12)}"
+            serviceName = "Wi-Call ${discoveryId(pin).take(12)}"
             serviceType = TYPE
             port = PORT
-            setAttribute("id", pin)
+            setAttribute("id", discoveryId(pin))
         }
         runCatching { manager.registerService(info, NsdManager.PROTOCOL_DNS_SD, listener) }
     }
@@ -57,7 +57,7 @@ internal class LanDiscovery(context: Context) {
             override fun onServiceLost(info: NsdServiceInfo) = Unit
             override fun onServiceFound(info: NsdServiceInfo) {
                 main.post {
-                    if (discovery !== this || resolving || !info.serviceName.startsWith("Wi-Call ${pin.take(12)}")) {
+                    if (discovery !== this || resolving || !info.serviceName.startsWith("Wi-Call ${discoveryId(pin).take(12)}")) {
                         return@post
                     }
                     resolving = true
@@ -70,7 +70,7 @@ internal class LanDiscovery(context: Context) {
                                 main.post {
                                     resolving = false
                                     if (service.port == PORT &&
-                                        service.attributes["id"]?.decodeToString() == pin) {
+                                        service.attributes["id"]?.decodeToString() == discoveryId(pin)) {
                                         service.host?.hostAddress?.takeIf(::privateIpv4)?.let(::finish)
                                     }
                                 }

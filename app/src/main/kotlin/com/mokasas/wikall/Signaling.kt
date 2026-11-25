@@ -13,7 +13,9 @@ import io.ktor.websocket.readText
 import io.netty.handler.ssl.SslHandler
 import java.io.IOException
 import java.net.Proxy
-import java.security.MessageDigest
+import java.security.PrivateKey
+import javax.net.SocketFactory
+import javax.net.ssl.SSLException
 import java.util.UUID
 import java.util.concurrent.ArrayBlockingQueue
 import java.util.concurrent.CountDownLatch
@@ -34,7 +36,7 @@ import okhttp3.WebSocket
 import okhttp3.WebSocketListener
 
 internal enum class SignalType {
-    PAIR, REJOIN, READY, PING, PONG, INVITE, ACCEPT, REJECT, BUSY, TIMEOUT, END, OFFER, ANSWER, ICE
+    CHALLENGE, AUTH, READY, PING, PONG, INVITE, ACCEPT, REJECT, BUSY, TIMEOUT, END, OFFER, ANSWER, ICE
 }
 
 internal data class Signal(val type: SignalType, val id: UUID, val payload: String? = null)
@@ -45,7 +47,7 @@ private const val SIGNAL_PATH = "/signals"
 private object SignalCodec {
     fun encode(signal: Signal): String {
         val payload = signal.payload?.let { Wire.encode(it.encodeToByteArray()) }.orEmpty()
-        val text = "2|${signal.type.name}|${signal.id}|$payload"
+        val text = "3|${signal.type.name}|${signal.id}|$payload"
         require(text.length <= MAX_SIGNAL_SIZE)
         return text
     }
@@ -53,35 +55,26 @@ private object SignalCodec {
     fun decode(text: String): Signal {
         require(text.length in 1..MAX_SIGNAL_SIZE)
         val parts = text.split('|', limit = 5)
-        require(parts.size == 4 && parts[0] == "2")
+        require(parts.size == 4 && parts[0] == "3")
         val type = SignalType.valueOf(parts[1])
         val id = UUID.fromString(parts[2])
         require(id.toString() == parts[2])
         val payload = parts[3].takeIf { it.isNotEmpty() }
             ?.let { Wire.decode(it).decodeToString(throwOnInvalidSequence = true) }
         when (type) {
-            SignalType.PAIR -> {
-                require(id == probeId)
-                val credentials = requireNotNull(payload).split('.')
-                require(credentials.size == 2 && credentials.all(::validCredential))
-            }
-            SignalType.REJOIN -> require(id == probeId && payload != null && validCredential(payload))
+            SignalType.CHALLENGE -> require(id == probeId && payload != null && validNonce(payload))
+            SignalType.AUTH -> require(id == probeId && payload != null && payload.length <= 420)
             SignalType.OFFER, SignalType.ANSWER, SignalType.ICE -> require(id != probeId && payload != null)
             else -> require(payload == null)
         }
         return Signal(type, id, payload)
     }
 
-    private fun validCredential(value: String): Boolean = value.length == 32 && Wire.decode(value).size == 24
 }
 
-internal fun credentialDigest(credential: String): String =
-    Wire.encode(MessageDigest.getInstance("SHA-256").digest(credential.encodeToByteArray()))
-
-internal interface PairedDevice {
-    fun digest(): String?
-    fun remember(digest: String)
-    fun revoke()
+internal interface EnrollmentRegistry {
+    fun find(number: String): Enrollment?
+    fun revoke(number: String)
 }
 
 internal interface SignalChannel : AutoCloseable {
@@ -92,7 +85,8 @@ internal class LocalHost(
     context: SSLContext,
     address: String,
     listenPort: Int = PORT,
-    private val pairedDevice: PairedDevice,
+    private val registry: EnrollmentRegistry,
+    private val serverPin: String,
 ) : AutoCloseable {
     private class Peer(private val session: WebSocketSession) : SignalChannel {
         val outbound = Channel<Signal>(capacity = 48)
@@ -108,17 +102,16 @@ internal class LocalHost(
     }
 
     private class Callbacks(
-        val onReady: (SignalChannel) -> Unit,
-        val onSignal: (Signal) -> Unit,
-        val onEnded: () -> Unit,
+        val onReady: (String, SignalChannel) -> Unit,
+        val onSignal: (String, Signal) -> Unit,
+        val onEnded: (String) -> Unit,
     )
 
     private val leaseLock = Any()
     private val attempts = Semaphore(3)
     private val closed = AtomicBoolean()
     @Volatile private var callbacks: Callbacks? = null
-    private var invitation: Pair<String, Long>? = null
-    private var active: Peer? = null
+    private val active = mutableMapOf<String, Peer>()
 
     private val listener = embeddedServer(Netty, configure = {
         connector {
@@ -146,13 +139,11 @@ internal class LocalHost(
         routing {
             webSocket(SIGNAL_PATH) {
                 val handler = callbacks ?: return@webSocket
-                if (!attempts.tryAcquire()) return@webSocket
                 val owner = Peer(this)
                 try {
                     servePeer(owner, handler, this)
                 } finally {
                     owner.outbound.cancel()
-                    attempts.release()
                 }
             }
         }
@@ -160,41 +151,45 @@ internal class LocalHost(
 
     val localPort: Int get() = runBlocking { listener.engine.resolvedConnectors().single().port }
 
-    fun setInvitation(token: String, expires: Long) = synchronized(leaseLock) {
-        check(!closed.get())
-        invitation = token to expires
-    }
-
-    fun revokeDevice() = synchronized(leaseLock) {
-        pairedDevice.revoke()
-        invitation = null
-        active?.let { peer ->
-            active = null
+    fun revokeDevice(number: String) = synchronized(leaseLock) {
+        registry.revoke(number)
+        active.remove(number)?.let { peer ->
             peer.close()
-            callbacks?.onEnded?.invoke()
+            callbacks?.onEnded?.invoke(number)
         }
     }
 
-    fun serve(onReady: (SignalChannel) -> Unit, onSignal: (Signal) -> Unit, onEnded: () -> Unit) {
+    fun serve(
+        onReady: (String, SignalChannel) -> Unit,
+        onSignal: (String, Signal) -> Unit,
+        onEnded: (String) -> Unit,
+    ) {
         check(callbacks == null)
         callbacks = Callbacks(onReady, onSignal, onEnded)
     }
 
     private suspend fun servePeer(owner: Peer, handler: Callbacks, session: WebSocketSession) {
-        var authorized = false
-        try {
-            val hello = withTimeout(5_000) { session.readSignal() }
+        if (!attempts.tryAcquire()) return
+        val number = try {
+            val challenge = Wire.token()
+            session.send(Frame.Text(SignalCodec.encode(Signal(SignalType.CHALLENGE, probeId, challenge))))
+            val hello = withTimeout(8_000) { session.readSignal() }
             synchronized(leaseLock) {
                 check(!closed.get())
-                authorize(hello)
-                active?.let { previous ->
+                val user = authorize(hello, challenge)
+                active.put(user, owner)?.let { previous ->
                     previous.close()
-                    handler.onEnded()
+                    handler.onEnded(user)
                 }
-                active = owner
-                authorized = true
-                handler.onReady(owner)
+                handler.onReady(user, owner)
+                user
             }
+        } catch (_: Exception) {
+            return
+        } finally {
+            attempts.release()
+        }
+        try {
             session.send(Frame.Text(SignalCodec.encode(Signal(SignalType.READY, probeId))))
             coroutineScope {
                 val writer = launch {
@@ -203,10 +198,10 @@ internal class LocalHost(
                 try {
                     while (true) {
                         val message = withTimeout(35_000) { session.readSignal() }
-                        require(message.type !in setOf(SignalType.PAIR, SignalType.REJOIN, SignalType.READY))
+                        require(message.type != SignalType.AUTH && message.type != SignalType.CHALLENGE && message.type != SignalType.READY)
                         if (message.type == SignalType.PING) owner.send(Signal(SignalType.PONG, message.id))
                         else synchronized(leaseLock) {
-                            if (active === owner) handler.onSignal(message)
+                            if (active[number] === owner) handler.onSignal(number, message)
                         }
                     }
                 } finally {
@@ -214,33 +209,27 @@ internal class LocalHost(
                 }
             }
         } catch (_: Exception) {
-            // Exiting the route closes unauthenticated or inactive connections.
+            // Exiting the route closes inactive connections.
         } finally {
-            if (authorized) synchronized(leaseLock) {
-                if (active === owner) {
-                    active = null
-                    handler.onEnded()
+            synchronized(leaseLock) {
+                if (active[number] === owner) {
+                    active.remove(number)
+                    handler.onEnded(number)
                 }
             }
         }
     }
 
-    private fun authorize(hello: Signal) {
-        val payload = requireNotNull(hello.payload)
-        when (hello.type) {
-            SignalType.PAIR -> {
-                val (token, expiration) = requireNotNull(invitation)
-                val (submitted, credential) = payload.split('.')
-                require(System.currentTimeMillis() < expiration && Wire.equal(token, submitted))
-                pairedDevice.remember(credentialDigest(credential))
-                invitation = null
-            }
-            SignalType.REJOIN -> {
-                val expected = requireNotNull(pairedDevice.digest())
-                require(Wire.equal(expected, credentialDigest(payload)))
-            }
-            else -> error("Expected pairing or resume")
-        }
+    private fun authorize(hello: Signal, challenge: String): String {
+        require(hello.type == SignalType.AUTH)
+        val parts = checkNotNull(hello.payload).split('.')
+        require(parts.size == 3)
+        val (number, id, signature) = parts
+        require(number in userNumbers)
+        val device = requireNotNull(registry.find(number))
+        require(!device.revoked && Wire.equal(device.activationId, id))
+        require(Wire.verified(publicKey(device.signing), activationProof(serverPin, number, id, challenge), Wire.decode(signature)))
+        return number
     }
 
     private suspend fun WebSocketSession.readSignal(): Signal =
@@ -249,17 +238,20 @@ internal class LocalHost(
     override fun close() {
         synchronized(leaseLock) {
             if (!closed.compareAndSet(false, true)) return
-            invitation = null
-            active?.close()
+            active.values.forEach { it.close() }
+            active.clear()
         }
         listener.stop(gracePeriodMillis = 0, timeoutMillis = 1_000)
     }
 }
 
-internal class LocalClient(private val host: String, pin: String, private val port: Int = PORT) : SignalChannel {
+internal class LocalClient(
+    private val host: String, pin: String, private val port: Int = PORT, localNetwork: SocketFactory? = null,
+) : SignalChannel {
     private val trust = pinnedTrust(pin)
     private val http = OkHttpClient.Builder()
         .proxy(Proxy.NO_PROXY)
+        .apply { if (localNetwork != null) socketFactory(localNetwork) }
         .sslSocketFactory(pinnedTls(trust).socketFactory, trust)
         .hostnameVerifier { hostname, _ -> hostname == host }
         .followRedirects(false)
@@ -271,9 +263,10 @@ internal class LocalClient(private val host: String, pin: String, private val po
     private val closed = AtomicBoolean()
     @Volatile private var socket: WebSocket? = null
     @Volatile private var upgraded = false
+    @Volatile private var failure: Throwable? = null
     private object Disconnected
 
-    fun connect(token: String?, credential: String): LocalClient {
+    fun connect(activation: Activation, signing: PrivateKey): LocalClient {
         val request = Request.Builder().url("wss://$host:$port$SIGNAL_PATH").build()
         try {
             check(!closed.get())
@@ -294,19 +287,28 @@ internal class LocalClient(private val host: String, pin: String, private val po
                 }
 
                 override fun onClosed(webSocket: WebSocket, code: Int, reason: String) = disconnected()
-                override fun onFailure(webSocket: WebSocket, t: Throwable, response: Response?) = disconnected()
+                override fun onFailure(webSocket: WebSocket, t: Throwable, response: Response?) {
+                    failure = t
+                    disconnected()
+                }
             })
             socket = transport
             if (closed.get()) transport.cancel()
             check(!closed.get() && ready.await(5, TimeUnit.SECONDS) && upgraded)
-            val hello = if (token == null) Signal(SignalType.REJOIN, probeId, credential)
-                else Signal(SignalType.PAIR, probeId, "$token.$credential")
-            send(hello)
+            val challenge = receive(5)
+            require(challenge.type == SignalType.CHALLENGE)
+            val signature = Wire.encode(Wire.signature(signing, activation.proof(checkNotNull(challenge.payload))))
+            send(Signal(SignalType.AUTH, probeId, "${activation.number}.${activation.id}.$signature"))
             check(receive(5) == Signal(SignalType.READY, probeId))
             return this
         } catch (error: Exception) {
             close()
-            throw IOException("تعذّر الاتصال المشفّر بالخادم المحلي. تحقق من الشبكة والاقتران.", error)
+            val status = when {
+                upgraded -> "رفض الخادم تفعيل هذا الجهاز. راجع رقم المستخدم وحالة تفعيله."
+                failure is SSLException -> "تعذّر التحقق من هوية الخادم. استخدم ملف تفعيل صادرًا من هذا الخادم."
+                else -> "تعذّر الوصول إلى $host. تحقق من تشغيل الخادم وإمكانية الوصول بين الهاتفين."
+            }
+            throw IOException(status, failure ?: error)
         }
     }
 

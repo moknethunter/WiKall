@@ -1,6 +1,8 @@
 package com.mokasas.wikall
 
 import android.content.Context
+import android.net.ConnectivityManager
+import android.net.NetworkCapabilities
 import android.os.Handler
 import android.os.Looper
 import android.os.SystemClock
@@ -8,9 +10,12 @@ import dagger.hilt.android.qualifiers.ApplicationContext
 import javax.inject.Inject
 import javax.inject.Singleton
 import java.net.Inet4Address
+import java.net.InetAddress
 import java.net.NetworkInterface
 import java.util.UUID
 import java.util.concurrent.Executors
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.withContext
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.asStateFlow
 
@@ -20,7 +25,9 @@ internal data class SessionState(
     val mode: Mode = Mode.HOME,
     val status: String = "",
     val address: String? = null,
-    val pin: String? = null,
+    val number: String? = null,
+    val devices: List<Enrollment> = emptyList(),
+    val onlineUsers: Set<String> = emptySet(),
     val peer: String? = null,
     val latency: Long? = null,
     val busy: Boolean = false,
@@ -45,6 +52,7 @@ internal class ConnectionController @Inject constructor(
     private var host: LocalHost? = null
     private var client: LocalClient? = null
     private var channel: SignalChannel? = null
+    private val onlineChannels = mutableMapOf<String, SignalChannel>()
     private var identity: ServerIdentity? = null
     private var hostAddress: String? = null
     private var waiting: Pair<UUID, Long>? = null
@@ -78,7 +86,7 @@ internal class ConnectionController @Inject constructor(
             val result = runCatching {
                 check(current == generation)
                 val keys = ServerIdentity.load()
-                val server = LocalHost(keys.tls(), address, pairedDevice = store)
+                val server = LocalHost(keys.tls(), address, registry = store, serverPin = Wire.pin(keys.entry.certificate.publicKey))
                 boundHost = server
                 keys to server
             }
@@ -90,14 +98,19 @@ internal class ConnectionController @Inject constructor(
                     hostAddress = address
                     val pin = Wire.pin(keys.entry.certificate.publicKey)
                     discovery.advertise(pin)
-                    publish(state.value.copy(address = address, pin = pin, busy = false, status = "الخادم يعمل على الشبكة المحلية."))
+                    publish(state.value.copy(address = address, number = HOST_NUMBER, busy = false, status = "الخادم جاهز. ينتظر اتصال هاتف مفعّل."))
+                    refreshUsers()
                     server.serve(
-                        { connection -> onMain(current) {
-                            channel = connection
-                            publish(state.value.copy(peer = "1001", status = "المستخدم 1001 متصل."))
+                        { number, connection -> onMain(current) {
+                            onlineChannels[number] = connection
+                            publish(state.value.copy(onlineUsers = onlineChannels.keys.toSet(), status = "المستخدم $number متصل."))
                         } },
-                        { message -> onMain(current) { received(message) } },
-                        { onMain(current) { disconnect("المستخدم 1001 غير متصل.") } },
+                        { number, message -> onMain(current) { receivedFrom(number, message) } },
+                        { number -> onMain(current) {
+                            onlineChannels.remove(number)
+                            if (state.value.peer == number) disconnect("المستخدم $number غير متصل.")
+                            publish(state.value.copy(onlineUsers = onlineChannels.keys.toSet()))
+                        } },
                     )
                 }.onFailure {
                     publish(state.value.copy(busy = false, status = "تعذّر تشغيل الخادم. تحقق من عنوان الشبكة والمنفذ."))
@@ -106,35 +119,43 @@ internal class ConnectionController @Inject constructor(
         }
     }
 
-    fun export(): ByteArray {
-        val server = checkNotNull(host)
+    suspend fun issue(request: DeviceRequest): Pair<String, ByteArray> {
         val key = checkNotNull(identity).entry
-        val profile = Profile(checkNotNull(hostAddress), Wire.token(), System.currentTimeMillis() + Profile.LIFETIME, key.certificate.publicKey)
-        val bytes = profile.export(key.privateKey)
-        server.setInvitation(profile.token, profile.expires)
-        return bytes
+        val address = checkNotNull(hostAddress)
+        val issued = withContext(Dispatchers.IO) {
+            val device = store.issue(request)
+            val activation = Activation(address, key.certificate.publicKey, device.number, device.serial, device.activationId)
+            device.number to activation.export(key.privateKey, request.encryption)
+        }
+        refreshUsers()
+        return issued
     }
 
-    fun revoke() {
+    fun revoke(number: String) {
         val server = host ?: return
+        val current = generation
         sender.execute {
-            val result = runCatching { server.revokeDevice() }
-            main.post {
-                if (host === server) disconnect(
-                    if (result.isSuccess) "أُلغي اقتران المستخدم 1001." else "تعذّر إلغاء الاقتران."
-                )
+            val result = runCatching { server.revokeDevice(number) }
+            onMain(current) {
+                val message = if (result.isSuccess) "أُلغي تفعيل المستخدم $number." else "تعذّر إلغاء تفعيل المستخدم."
+                publish(state.value.copy(status = message))
+                refreshUsers()
             }
         }
     }
 
-    fun connect(profile: Profile, manual: String?) {
+    private fun refreshUsers() {
+        val current = generation
+        sender.execute {
+            val users = runCatching(store::devices).getOrNull() ?: return@execute
+            onMain(current) { publish(state.value.copy(devices = users)) }
+        }
+    }
+
+    fun connect(activation: Activation, file: ByteArray, manual: String? = null) {
         require(manual == null || privateIpv4(manual))
         stop()
-        if (profile.expires <= System.currentTimeMillis()) {
-            publish(SessionState(mode = Mode.CLIENT, status = "انتهت صلاحية الملف. أنشئ ملفًا جديدًا."))
-            return
-        }
-        locate(SavedConnection(manual ?: profile.host, profile.pin, Wire.token()), profile.token, manual != null)
+        locate(SavedConnection(manual ?: activation.address, activation, file), manual != null)
     }
 
     fun reconnect(manual: String? = null) {
@@ -143,10 +164,10 @@ internal class ConnectionController @Inject constructor(
         publish(SessionState(mode = Mode.CLIENT, busy = true, status = "جارٍ قراءة الاتصال المحفوظ…"))
         val current = generation
         worker.execute {
-            val saved = runCatching(store::saved).getOrNull()
+            val saved = runCatching { store.saved(DeviceIdentity.load()) }.getOrNull()
             onMain(current) {
-                if (saved == null) publish(SessionState(mode = Mode.CLIENT, status = "استورد ملف اقتران للاتصال."))
-                else locate(saved.copy(address = manual ?: saved.address), null, manual != null)
+                if (saved == null) publish(SessionState(mode = Mode.CLIENT, status = "استورد ملف تفعيل صادرًا لهذا الهاتف."))
+                else locate(saved.copy(address = manual ?: saved.address), manual != null)
             }
         }
     }
@@ -157,39 +178,45 @@ internal class ConnectionController @Inject constructor(
         publish(SessionState(mode = Mode.CLIENT, status = "حُذف الاتصال المحفوظ من هذا الهاتف."))
     }
 
-    private fun locate(saved: SavedConnection, token: String?, manual: Boolean) {
-        publish(SessionState(mode = Mode.CLIENT, busy = true, address = saved.address, status = "جارٍ البحث عن الخادم المحلي…"))
-        if (manual) open(saved, token)
+    private fun locate(saved: SavedConnection, manual: Boolean) {
+        publish(SessionState(mode = Mode.CLIENT, busy = true, address = saved.address, number = saved.activation.number, status = "جارٍ البحث عن الخادم المحلي…"))
+        if (manual) open(saved)
         else {
             val current = generation
             discovery.find(saved.pin) { address ->
                 if (current == generation) {
                     val discovered = address?.takeIf { it != saved.address }
-                    open(saved.copy(address = discovered ?: saved.address), token, saved.takeIf { discovered != null })
+                    open(saved.copy(address = discovered ?: saved.address), saved.takeIf { discovered != null })
                 }
             }
         }
     }
 
-    private fun open(saved: SavedConnection, token: String?, fallback: SavedConnection? = null) {
+    private fun open(saved: SavedConnection, fallback: SavedConnection? = null) {
         val current = generation
         publish(state.value.copy(busy = true, address = saved.address, status = "جارٍ التحقق من هوية الخادم…"))
         worker.execute {
             var online = false
             var endpoint: LocalClient? = null
             try {
-                endpoint = LocalClient(saved.address, saved.pin)
+                val device = DeviceIdentity.load()
+                require(device.request.serial == saved.activation.serial)
+                val trusted = store.saved(device)
+                require(trusted == null || Wire.equal(trusted.pin, saved.pin)) {
+                    "هذا الهاتف موثّق بخادم آخر. انس التفعيل المحفوظ قبل الانتقال إلى خادم جديد."
+                }
+                endpoint = LocalClient(saved.address, saved.pin, localNetwork = lanSocketFactory(saved.address))
                 val candidate = endpoint
                 main.post {
                     if (current == generation) client = candidate else candidate.close()
                 }
-                val active = endpoint.connect(token, saved.credential)
+                val active = endpoint.connect(saved.activation, device.signing)
                 online = true
                 onMain(current) {
                     retryCount = 0
                     channel = active
                     publish(state.value.copy(
-                        peer = "1000", busy = false,
+                        peer = HOST_NUMBER, busy = false,
                         status = "متصل بالخادم المحلي.",
                     ))
                     sender.execute {
@@ -214,17 +241,16 @@ internal class ConnectionController @Inject constructor(
                     val message = active.receive()
                     onMain(current) { received(message) }
                 }
-            } catch (_: Exception) {
-                val retryConnection = token == null || online
+            } catch (failure: Exception) {
                 onMain(current) {
                     if (!online && fallback != null) {
-                        open(fallback, token)
+                        open(fallback)
                         return@onMain
                     }
-                    disconnect(if (online) "انقطع اتصال الخادم." else "تعذّر الاتصال. تحقق من الشبكة والاقتران.")
-                    if (retryConnection && retryCount < RETRY_DELAYS.size) {
+                    disconnect(if (online) "انقطع اتصال الخادم." else failure.message.orEmpty().ifBlank { "تعذّر الاتصال المحلي." })
+                    if ((online || retryCount > 0) && retryCount < RETRY_DELAYS.size) {
                         val delay = RETRY_DELAYS[retryCount++]
-                        retry = Runnable { locate(saved, null, false) }.also { main.postDelayed(it, delay) }
+                        retry = Runnable { locate(saved, false) }.also { main.postDelayed(it, delay) }
                     }
                 }
             } finally {
@@ -234,7 +260,11 @@ internal class ConnectionController @Inject constructor(
     }
 
     fun dial(peer: String) {
-        if (channel == null || state.value.peer != peer) return
+        if (call.id != null) return
+        if (state.value.mode == Mode.SERVER) {
+            val target = onlineChannels[peer] ?: return
+            selectPeer(peer, target)
+        } else if (channel == null || state.value.peer != peer) return
         call.dial()?.let(::send)
         changed()
     }
@@ -296,6 +326,43 @@ internal class ConnectionController @Inject constructor(
                 publish(state.value.copy(latency = null, status = "انتهت مهلة فحص الاتصال."))
             }
         }, 5_000L)
+    }
+
+    private fun selectPeer(number: String, target: SignalChannel) {
+        if (channel !== target) {
+            waiting = null
+            channel = target
+            publish(state.value.copy(peer = number, latency = null))
+        }
+    }
+
+    private fun receivedFrom(number: String, message: Signal) {
+        val target = onlineChannels[number] ?: return
+        if (call.id != null && state.value.peer != number) {
+            if (message.type == SignalType.INVITE) sendTo(target, Signal(SignalType.BUSY, message.id))
+            return
+        }
+        if (call.id == null && message.type == SignalType.INVITE) selectPeer(number, target)
+        if (channel === target) received(message)
+    }
+
+    private fun lanSocketFactory(address: String): javax.net.SocketFactory? {
+        val manager = context.getSystemService(ConnectivityManager::class.java)
+        val target = InetAddress.getByName(address)
+        return manager.allNetworks.firstOrNull { network ->
+            val capabilities = manager.getNetworkCapabilities(network) ?: return@firstOrNull false
+            if (!capabilities.hasTransport(NetworkCapabilities.TRANSPORT_WIFI) &&
+                !capabilities.hasTransport(NetworkCapabilities.TRANSPORT_ETHERNET)) return@firstOrNull false
+            manager.getLinkProperties(network)?.linkAddresses?.any { link ->
+                val local = link.address.address
+                val remote = target.address
+                local.size == remote.size && local.indices.all { index ->
+                    val bits = (link.prefixLength - index * 8).coerceIn(0, 8)
+                    val mask = (0xff shl (8 - bits)) and 0xff
+                    ((local[index].toInt() xor remote[index].toInt()) and mask) == 0
+                }
+            } == true
+        }?.socketFactory
     }
 
     private fun received(message: Signal) {
@@ -364,6 +431,10 @@ internal class ConnectionController @Inject constructor(
 
     private fun send(message: Signal) {
         val active = channel ?: return
+        sendTo(active, message)
+    }
+
+    private fun sendTo(active: SignalChannel, message: Signal) {
         sender.execute {
             try {
                 active.send(message)
@@ -394,6 +465,7 @@ internal class ConnectionController @Inject constructor(
         host = null
         identity = null
         hostAddress = null
+        onlineChannels.clear()
         disconnect("")
         call = LocalCall()
         publish(SessionState())

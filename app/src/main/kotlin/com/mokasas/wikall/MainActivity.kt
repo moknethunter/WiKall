@@ -14,6 +14,15 @@ import androidx.activity.compose.setContent
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Column
+import androidx.compose.foundation.Image
+import androidx.compose.foundation.layout.Row
+import androidx.compose.foundation.layout.size
+import androidx.compose.foundation.shape.RoundedCornerShape
+import androidx.compose.material3.Card
+import androidx.compose.material3.CardDefaults
+import androidx.compose.material3.HorizontalDivider
+import androidx.compose.ui.Alignment
+import androidx.compose.ui.res.painterResource
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.padding
@@ -55,8 +64,11 @@ import kotlinx.coroutines.withContext
 class MainActivity : ComponentActivity() {
     @Inject internal lateinit var controller: ConnectionController
     private var selectedMode by mutableStateOf(Mode.HOME)
-    private var imported by mutableStateOf<Profile?>(null)
-    private var exported by mutableStateOf<Uri?>(null)
+    private data class ImportedActivation(val license: Activation, val bytes: ByteArray)
+    private data class SharedDocument(val uri: Uri, val mime: String)
+    private var imported by mutableStateOf<ImportedActivation?>(null)
+    private var request by mutableStateOf<DeviceRequest?>(null)
+    private var exported by mutableStateOf<SharedDocument?>(null)
     private var note by mutableStateOf("")
     private var resumed by mutableStateOf(false)
     private var attemptedAudio: UUID? = null
@@ -70,22 +82,43 @@ class MainActivity : ComponentActivity() {
     private val notifications = registerForActivityResult(ActivityResultContracts.RequestPermission()) { granted ->
         if (!granted) note = "يمكنك تفعيل إشعارات Wi-Call من إعدادات الهاتف لاستقبال تنبيه المكالمات في الخلفية."
     }
-    private val openProfile = registerForActivityResult(ActivityResultContracts.OpenDocument()) { uri ->
-        uri?.let(::import)
+    private val openActivation = registerForActivityResult(ActivityResultContracts.OpenDocument()) { uri ->
+        uri?.let { import(it, false) }
     }
-    private val saveProfile = registerForActivityResult(ActivityResultContracts.CreateDocument(PROFILE_MIME)) { uri ->
+    private val openRequest = registerForActivityResult(ActivityResultContracts.OpenDocument()) { uri ->
+        uri?.let { import(it, true) }
+    }
+    private val saveRequest = registerForActivityResult(ActivityResultContracts.CreateDocument(REQUEST_MIME)) { uri ->
         if (uri != null) {
-            lifecycleScope.launch {
-                val result = runCatching {
-                    val bytes = controller.export()
-                    withContext(Dispatchers.IO) {
-                        checkNotNull(contentResolver.openOutputStream(uri, "wt")).use { it.write(bytes) }
-                    }
+            saveDocument(uri, REQUEST_MIME) {
+                val identity = withContext(Dispatchers.IO) { DeviceIdentity.load() }
+                "أرسل طلب الجهاز إلى هاتف الخادم." to identity.request.export(identity.signing)
+            }
+        }
+    }
+    private val saveActivation = registerForActivityResult(ActivityResultContracts.CreateDocument(ACTIVATION_MIME)) { uri ->
+        val device = request
+        if (uri != null && device != null) {
+            saveDocument(uri, ACTIVATION_MIME) {
+                val (number, bytes) = controller.issue(device)
+                request = null
+                "صدر تفعيل المستخدم $number. أرسل الملف إلى صاحب الطلب." to bytes
+            }
+        }
+    }
+
+    private fun saveDocument(uri: Uri, mime: String, produce: suspend () -> Pair<String, ByteArray>) {
+        lifecycleScope.launch {
+            runCatching {
+                val (summary, bytes) = produce()
+                withContext(Dispatchers.IO) {
+                    checkNotNull(contentResolver.openOutputStream(uri, "wt")).use { it.write(bytes) }
                 }
-                if (result.isSuccess) {
-                    exported = uri
-                    note = "شارك الملف خلال خمس دقائق."
-                } else note = "تعذّر إنشاء الملف. تحقق من تشغيل الخادم."
+                exported = SharedDocument(uri, mime)
+                note = summary
+            }.onFailure { failure ->
+                note = if (failure is CapacityReached) "وصل الخادم إلى الحد الأقصى وهو عشرة مستخدمين."
+                    else "تعذّر إعداد الملف. تأكد من مساحة التخزين وحالة الخادم."
             }
         }
     }
@@ -97,8 +130,11 @@ class MainActivity : ComponentActivity() {
         setContent {
             CompositionLocalProvider(LocalLayoutDirection provides LayoutDirection.Rtl) {
                 MaterialTheme(colorScheme = darkColorScheme(
-                    primary = Color(0xFF5DECC2), onPrimary = Color(0xFF102020),
-                    background = Color(0xFF101820), surface = Color(0xFF1C2B35),
+                    primary = Color(0xFF75F0CA), onPrimary = Color(0xFF06251D),
+                    secondary = Color(0xFFADC9FF), onSecondary = Color(0xFF132541),
+                    background = Color(0xFF0C1423), surface = Color(0xFF162337),
+                    surfaceVariant = Color(0xFF203148), onSurfaceVariant = Color(0xFFD0DDF0),
+                    outline = Color(0xFF7D91AE),
                 )) {
                     val session by controller.state.collectAsState()
                     LaunchedEffect(session.peer, session.mode) {
@@ -148,8 +184,7 @@ class MainActivity : ComponentActivity() {
         var addressChoices by remember { mutableStateOf<List<String>?>(null) }
         var manualAction by remember { mutableStateOf<((String) -> Unit)?>(null) }
         var addressInput by remember { mutableStateOf("") }
-        var fingerprint by remember { mutableStateOf<Pair<Profile, String?>?>(null) }
-        var revoke by remember { mutableStateOf(false) }
+        var revoke by remember { mutableStateOf<String?>(null) }
         BackHandler(mode != Mode.HOME) {
             if (session.mode == Mode.HOME) selectedMode = Mode.HOME else moveTaskToBack(true)
         }
@@ -157,59 +192,118 @@ class MainActivity : ComponentActivity() {
             Modifier.safeDrawingPadding().fillMaxSize().verticalScroll(rememberScrollState()).padding(22.dp),
             verticalArrangement = Arrangement.spacedBy(12.dp),
         ) {
-            Text(getString(R.string.app_name), style = MaterialTheme.typography.headlineLarge, color = MaterialTheme.colorScheme.primary)
+            Row(
+                horizontalArrangement = Arrangement.spacedBy(12.dp),
+                verticalAlignment = Alignment.CenterVertically,
+            ) {
+                Image(painterResource(R.drawable.ic_wikall), contentDescription = null, modifier = Modifier.size(52.dp))
+                Column {
+                    Text(getString(R.string.app_name), style = MaterialTheme.typography.headlineMedium)
+                    Text("مكالمات محلية", color = MaterialTheme.colorScheme.onSurfaceVariant)
+                }
+            }
             when (mode) {
                 Mode.HOME -> {
-                    Text("مكالمات محلية عبر Wi-Fi أو نقطة الاتصال")
-                    Action("وضع الخادم · 1000") { selectedMode = Mode.SERVER }
-                    Action("وضع العميل · 1001", true) { selectedMode = Mode.CLIENT }
+                    Panel("اختر دور هذا الهاتف") {
+                        Action("إدارة الخادم · $HOST_NUMBER") { selectedMode = Mode.SERVER }
+                        Action("الانضمام إلى خادم", true) { selectedMode = Mode.CLIENT }
+                    }
                 }
                 Mode.SERVER -> {
-                    Text("الخادم المحلي · 1000", style = MaterialTheme.typography.titleLarge)
-                    if (session.address != null) {
-                        Text("${session.address}:$PORT", style = TextStyle(textDirection = TextDirection.Ltr))
-                        session.pin?.let { Text("بصمة الخادم SHA-256\n${groupPin(it)}") }
-                        Action("إنشاء ملف .mokprofile") { saveProfile.launch("Wi-Call-1001.mokprofile") }
-                        exported?.let { uri -> Action("مشاركة الملف", true) { share(uri) } }
-                        Action("إلغاء اقتران العميل", true) { revoke = true }
-                    } else if (!session.busy) {
-                        Action("تشغيل الخادم") {
-                            val addresses = runCatching(controller::listAddresses).getOrDefault(emptyList())
-                            when (addresses.size) {
-                                0 -> {
-                                    addressInput = ""
-                                    manualAction = { runSession { controller.start(it) } }
+                    Panel("لوحة الخادم · $HOST_NUMBER") {
+                        Text(session.status.ifBlank { "وصّل الهواتف بالشبكة نفسها، ثم شغّل الخادم." })
+                        val address = session.address
+                        if (address != null) {
+                            Text("$address:$PORT", style = TextStyle(textDirection = TextDirection.Ltr))
+                            Text("المتصلون ${session.onlineUsers.size} · الأرقام المخصصة ${session.devices.size} من $USER_LIMIT")
+                        } else if (!session.busy) {
+                            Action("تشغيل الخادم") {
+                                val addresses = runCatching(controller::listAddresses).getOrDefault(emptyList())
+                                when (addresses.size) {
+                                    0 -> {
+                                        addressInput = ""
+                                        manualAction = { runSession { controller.start(it) } }
+                                    }
+                                    1 -> runSession { controller.start(addresses.single()) }
+                                    else -> addressChoices = addresses
                                 }
-                                1 -> runSession { controller.start(addresses.single()) }
-                                else -> addressChoices = addresses
+                            }
+                        }
+                    }
+                    session.peer?.takeIf { session.callId != null }?.let { peer ->
+                        Panel("المكالمة") { CallPane(session, peer) }
+                    }
+                    if (session.address != null) {
+                        Panel("الأجهزة") {
+                            if (session.devices.isEmpty()) Text("استورد طلب الجهاز الذي تريد إضافته.")
+                            session.devices.forEach { user ->
+                                val connected = user.number in session.onlineUsers
+                                Text(
+                                    "المستخدم ${user.number} · " + when {
+                                        user.revoked -> "التفعيل ملغى"
+                                        connected -> "متصل"
+                                        else -> "غير متصل"
+                                    },
+                                    style = MaterialTheme.typography.titleMedium,
+                                )
+                                if (connected && session.callId == null) {
+                                    Action("اتصل بـ ${user.number}") { withMicrophone { controller.dial(user.number) } }
+                                }
+                                if (!user.revoked) {
+                                    Action("إلغاء تفعيل ${user.number}", true) { revoke = user.number }
+                                }
+                                HorizontalDivider()
+                            }
+                            Action("استيراد طلب جهاز", true) { openRequest.launch(arrayOf("*/*")) }
+                            request?.let { pending ->
+                                Text("معرّف الطلب ${pending.serial.take(12)}", style = TextStyle(textDirection = TextDirection.Content))
+                                Action("إصدار ملف تفعيل") { saveActivation.launch("Wi-Call-${pending.serial.take(8)}.wiactivation") }
+                            }
+                            exported?.takeIf { it.mime == ACTIVATION_MIME }?.let { document ->
+                                Action("مشاركة ملف التفعيل", true) { share(document) }
                             }
                         }
                     }
                 }
                 Mode.CLIENT -> {
-                    Text("العميل المحلي · 1001", style = MaterialTheme.typography.titleLarge)
-                    if (session.peer == null && !session.busy) {
-                        Action("إعادة الاتصال بالاقتران المحفوظ") { runSession { controller.reconnect() } }
-                        Action("استيراد .mokprofile", true) { openProfile.launch(arrayOf("*/*")) }
-                        imported?.let { file ->
-                            Action("التحقق من البصمة والاتصال") { fingerprint = file to null }
-                        }
-                        Action("عنوان IP يدوي", true) {
-                            addressInput = imported?.host ?: session.address.orEmpty()
-                            manualAction = { address ->
-                                val file = imported
-                                if (file == null) runSession { controller.reconnect(address) }
-                                else fingerprint = file to address
+                    val peer = session.peer
+                    Panel(session.number?.let { "رقمي · $it" } ?: "الانضمام إلى خادم") {
+                        Text(session.status.ifBlank { "أنشئ طلب جهاز وأرسله لمسؤول الخادم، ثم استورد ملف التفعيل الذي يعطيك إياه." })
+                        session.address?.let { Text(it, style = TextStyle(textDirection = TextDirection.Ltr)) }
+                        if (peer == null && !session.busy) {
+                            imported?.let { current ->
+                                Action("اتصل بالخادم · ${current.license.number}") {
+                                    runSession { controller.connect(current.license, current.bytes) }
+                                }
+                            } ?: Action("الاتصال بالتفعيل المحفوظ") { runSession { controller.reconnect() } }
+                            Action("عنوان IP يدوي", true) {
+                                addressInput = imported?.license?.address ?: session.address.orEmpty()
+                                manualAction = { address ->
+                                    val file = imported
+                                    runSession {
+                                        if (file == null) controller.reconnect(address)
+                                        else controller.connect(file.license, file.bytes, address)
+                                    }
+                                }
                             }
                         }
-                        Action("نسيان الاتصال المحفوظ", true) { controller.forget(); imported = null }
+                    }
+                    if (peer != null) {
+                        Panel("المكالمة") { CallPane(session, peer) }
+                    } else if (!session.busy) {
+                        Panel("تفعيل هذا الهاتف") {
+                            Action("إنشاء طلب جهاز") { saveRequest.launch("Wi-Call.wirequest") }
+                            exported?.takeIf { it.mime == REQUEST_MIME }?.let { document ->
+                                Action("مشاركة طلب الجهاز", true) { share(document) }
+                            }
+                            Action("استيراد ملف التفعيل", true) { openActivation.launch(arrayOf("*/*")) }
+                            Action("نسيان التفعيل المحفوظ", true) { controller.forget(); imported = null }
+                        }
                     }
                 }
             }
-            if (session.status.isNotBlank()) Text(session.status)
             if (session.busy) Action("إلغاء الاتصال", true, ::leave)
-            session.peer?.let { peer -> CallPane(session, peer) }
-            if (note.isNotBlank()) Text(note)
+            if (note.isNotBlank()) Text(note, color = MaterialTheme.colorScheme.onSurfaceVariant)
             if (mode != Mode.HOME) Action("العودة لاختيار الوضع", true, ::leave)
         }
 
@@ -242,26 +336,28 @@ class MainActivity : ComponentActivity() {
                 dismissButton = { Action("إلغاء", true) { manualAction = null } },
             )
         }
-        fingerprint?.let { (file, address) ->
+        revoke?.let { number ->
             AlertDialog(
-                onDismissRequest = { fingerprint = null },
-                title = { Text("تحقق من هوية الخادم") },
-                text = { Text("قارن البصمة كاملة مع شاشة الخادم.\n\n${groupPin(file.pin)}") },
-                confirmButton = { Action("البصمة مطابقة") {
-                    fingerprint = null
-                    runSession { controller.connect(file, address) }
-                } },
-                dismissButton = { Action("إلغاء", true) { fingerprint = null } },
+                onDismissRequest = { revoke = null },
+                title = { Text("إلغاء تفعيل $number") },
+                text = { Text("سينقطع اتصال هذا الجهاز، وسيحتاج إلى ملف تفعيل جديد للعودة بالرقم نفسه.") },
+                confirmButton = { Action("إلغاء التفعيل") { revoke = null; controller.revoke(number) } },
+                dismissButton = { Action("رجوع", true) { revoke = null } },
             )
         }
-        if (revoke) {
-            AlertDialog(
-                onDismissRequest = { revoke = false },
-                title = { Text("إلغاء اقتران المستخدم 1001") },
-                text = { Text("سيحتاج الهاتف الثاني إلى ملف اقتران جديد.") },
-                confirmButton = { Action("إلغاء الاقتران") { revoke = false; controller.revoke() } },
-                dismissButton = { Action("رجوع", true) { revoke = false } },
-            )
+    }
+
+    @Composable
+    private fun Panel(title: String, content: @Composable () -> Unit) {
+        Card(
+            colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surface),
+            shape = RoundedCornerShape(20.dp),
+            modifier = Modifier.fillMaxWidth(),
+        ) {
+            Column(Modifier.padding(16.dp), verticalArrangement = Arrangement.spacedBy(10.dp)) {
+                Text(title, style = MaterialTheme.typography.titleLarge)
+                content()
+            }
         }
     }
 
@@ -351,6 +447,7 @@ class MainActivity : ComponentActivity() {
         note = ""
         exported = null
         imported = null
+        request = null
     }
 
     @Suppress("DEPRECATION")
@@ -361,46 +458,72 @@ class MainActivity : ComponentActivity() {
                 else intent.getParcelableExtra(Intent.EXTRA_STREAM)
             else -> null
         }
-        uri?.let(::import)
+        uri?.let { import(it, intent.type == REQUEST_MIME) }
     }
 
-    private fun import(uri: Uri) {
+    private fun import(uri: Uri, isRequest: Boolean) {
         if (uri.scheme != "content") return
-        selectedMode = Mode.CLIENT
+        if (isRequest && controller.state.value.mode != Mode.SERVER) {
+            selectedMode = Mode.SERVER
+            note = "شغّل الخادم ثم اختر استيراد طلب جهاز."
+            return
+        }
+        if (!isRequest) {
+            if (controller.state.value.mode != Mode.HOME) controller.stop()
+            selectedMode = Mode.CLIENT
+            imported = null
+        } else request = null
         lifecycleScope.launch {
-            val file = withContext(Dispatchers.IO) {
-                runCatching {
-                    val bytes = checkNotNull(contentResolver.openInputStream(uri)).use { stream ->
-                        val buffer = ByteArray(Profile.MAX_SIZE + 1)
-                        var size = 0
-                        while (size < buffer.size) {
-                            val read = stream.read(buffer, size, buffer.size - size)
-                            if (read <= 0) break
-                            size += read
-                        }
-                        buffer.copyOf(size)
+            runCatching {
+                withContext(Dispatchers.IO) {
+                    val bytes = readDocument(uri)
+                    if (isRequest) DeviceRequest.read(bytes)
+                    else {
+                        val identity = DeviceIdentity.load()
+                        ImportedActivation(Activation.read(bytes, identity.decryption, identity.request.serial), bytes)
                     }
-                    Profile.read(bytes)
-                }.getOrNull()
+                }
+            }.onSuccess { file ->
+                when (file) {
+                    is DeviceRequest -> { request = file; note = "تحقق أن الطلب وصل من الهاتف الذي تريد إضافته." }
+                    is ImportedActivation -> {
+                        imported = file
+                        note = ""
+                        runSession { controller.connect(file.license, file.bytes) }
+                    }
+                    else -> Unit
+                }
+            }.onFailure {
+                note = if (isRequest) "ملف طلب الجهاز غير صالح."
+                    else "تعذّر فتح التفعيل. استخدم الملف الصادر لهذا الهاتف والنسخة الحالية من التطبيق."
             }
-            imported = file
-            note = if (file != null) "طابق بصمة الخادم للاتصال." else "ملف اقتران غير صالح أو منتهي الصلاحية."
         }
     }
 
-    private fun share(uri: Uri) {
+    private fun readDocument(uri: Uri): ByteArray =
+        checkNotNull(contentResolver.openInputStream(uri)).use { stream ->
+            val buffer = ByteArray(FILE_LIMIT + 1)
+            var size = 0
+            while (size < buffer.size) {
+                val read = stream.read(buffer, size, buffer.size - size)
+                if (read <= 0) break
+                size += read
+            }
+            buffer.copyOf(size)
+        }
+
+    private fun share(document: SharedDocument) {
         val send = Intent(Intent.ACTION_SEND).apply {
-            type = PROFILE_MIME
-            putExtra(Intent.EXTRA_STREAM, uri)
-            clipData = ClipData.newRawUri("Wi-Call", uri)
+            type = document.mime
+            putExtra(Intent.EXTRA_STREAM, document.uri)
+            clipData = ClipData.newRawUri("Wi-Call", document.uri)
             addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
         }
-        startActivity(Intent.createChooser(send, "مشاركة ملف الاتصال"))
+        startActivity(Intent.createChooser(send, "مشاركة الملف"))
     }
 
-    private fun groupPin(pin: String) = pin.chunked(4).chunked(4).joinToString("\n") { it.joinToString(" ") }
-
     private companion object {
-        const val PROFILE_MIME = "application/vnd.mokasas.profile"
+        const val REQUEST_MIME = "application/vnd.wikall.request"
+        const val ACTIVATION_MIME = "application/vnd.wikall.activation"
     }
 }

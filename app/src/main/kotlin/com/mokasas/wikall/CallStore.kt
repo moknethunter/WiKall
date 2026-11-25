@@ -1,28 +1,35 @@
 package com.mokasas.wikall
 
 import android.content.Context
-import android.security.keystore.KeyGenParameterSpec
-import android.security.keystore.KeyProperties
 import androidx.room.Dao
 import androidx.room.Database
 import androidx.room.Entity
+import androidx.room.Index
 import androidx.room.Insert
 import androidx.room.OnConflictStrategy
 import androidx.room.PrimaryKey
 import androidx.room.Query
 import androidx.room.Room
 import androidx.room.RoomDatabase
+import androidx.room.Transaction
+import androidx.room.migration.Migration
+import androidx.sqlite.db.SupportSQLiteDatabase
 import dagger.hilt.android.qualifiers.ApplicationContext
-import java.security.KeyStore
-import javax.crypto.Cipher
-import javax.crypto.KeyGenerator
-import javax.crypto.SecretKey
-import javax.crypto.spec.GCMParameterSpec
 import javax.inject.Inject
 import javax.inject.Singleton
 
-@Entity
-internal data class Device(@PrimaryKey val number: String, val credentialDigest: String)
+@Entity(indices = [Index(value = ["serial"], unique = true)])
+internal data class AssignedDevice(
+    @PrimaryKey val number: String,
+    val serial: String,
+    val signing: String,
+    val encryption: String,
+    val activationId: String,
+    val revoked: Boolean,
+) {
+    constructor(value: Enrollment) : this(value.number, value.serial, value.signing, value.encryption, value.activationId, value.revoked)
+    fun enrollment() = Enrollment(number, serial, signing, encryption, activationId, revoked)
+}
 
 @Entity
 internal data class ConnectionProfile(@PrimaryKey val slot: Int, val address: String, val pin: String, val credential: String)
@@ -31,74 +38,79 @@ internal data class ConnectionProfile(@PrimaryKey val slot: Int, val address: St
 internal data class CallHistory(@PrimaryKey val id: String, val peer: String, val state: String, val endedAt: Long)
 
 @Dao
-internal interface LocalData {
-    @Query("SELECT * FROM Device WHERE number = '1001'")
-    fun device(): Device?
+internal abstract class LocalData {
+    @Query("SELECT * FROM AssignedDevice ORDER BY number")
+    abstract fun devices(): List<AssignedDevice>
+
+    @Query("SELECT * FROM AssignedDevice WHERE number = :number")
+    abstract fun device(number: String): AssignedDevice?
 
     @Insert(onConflict = OnConflictStrategy.REPLACE)
-    fun rememberDevice(device: Device)
+    abstract fun saveDevice(device: AssignedDevice)
 
-    @Query("DELETE FROM Device WHERE number = '1001'")
-    fun revokeDevice()
+    @Transaction
+    open fun issue(request: DeviceRequest): Enrollment {
+        val issued = allocate(devices().map(AssignedDevice::enrollment), request)
+        saveDevice(AssignedDevice(issued))
+        return issued
+    }
+
+    @Query("UPDATE AssignedDevice SET revoked = 1 WHERE number = :number")
+    abstract fun revokeDevice(number: String)
 
     @Query("SELECT * FROM ConnectionProfile WHERE slot = 0")
-    fun profile(): ConnectionProfile?
+    abstract fun profile(): ConnectionProfile?
 
     @Insert(onConflict = OnConflictStrategy.REPLACE)
-    fun saveProfile(profile: ConnectionProfile)
+    abstract fun saveProfile(profile: ConnectionProfile)
 
     @Query("DELETE FROM ConnectionProfile")
-    fun forgetProfile()
+    abstract fun forgetProfile()
 
     @Insert(onConflict = OnConflictStrategy.IGNORE)
-    fun record(call: CallHistory)
+    abstract fun record(call: CallHistory)
 }
 
-@Database(entities = [Device::class, ConnectionProfile::class, CallHistory::class], version = 1, exportSchema = false)
+@Database(entities = [AssignedDevice::class, ConnectionProfile::class, CallHistory::class], version = 2, exportSchema = false)
 internal abstract class LocalDatabase : RoomDatabase() {
     abstract fun data(): LocalData
 }
 
-internal data class SavedConnection(val address: String, val pin: String, val credential: String)
+internal data class SavedConnection(val address: String, val activation: Activation, val file: ByteArray) {
+    val pin get() = activation.pin
+}
 
 @Singleton
-internal class CallStore @Inject constructor(@ApplicationContext context: Context) : PairedDevice {
-    private val data = Room.databaseBuilder(context, LocalDatabase::class.java, "wi-call.db").build().data()
+internal class CallStore @Inject constructor(@ApplicationContext context: Context) : EnrollmentRegistry {
+    private val data = Room.databaseBuilder(context, LocalDatabase::class.java, "wi-call.db")
+        .addMigrations(object : Migration(1, 2) {
+            override fun migrate(db: SupportSQLiteDatabase) {
+                db.execSQL("DROP TABLE IF EXISTS Device")
+                db.execSQL("DELETE FROM ConnectionProfile")
+                db.execSQL("""
+                    CREATE TABLE IF NOT EXISTS AssignedDevice (
+                        number TEXT NOT NULL PRIMARY KEY, serial TEXT NOT NULL, signing TEXT NOT NULL,
+                        encryption TEXT NOT NULL, activationId TEXT NOT NULL, revoked INTEGER NOT NULL
+                    )
+                """.trimIndent())
+                db.execSQL("CREATE UNIQUE INDEX IF NOT EXISTS index_AssignedDevice_serial ON AssignedDevice(serial)")
+            }
+        }).build().data()
 
-    override fun digest(): String? = data.device()?.credentialDigest
-    override fun remember(digest: String) = data.rememberDevice(Device("1001", digest))
-    override fun revoke() = data.revokeDevice()
+    override fun find(number: String) = data.device(number)?.enrollment()
+    override fun revoke(number: String) = data.revokeDevice(number)
+    fun devices() = data.devices().map(AssignedDevice::enrollment)
+    fun issue(request: DeviceRequest) = data.issue(request)
 
-    fun saved(): SavedConnection? = data.profile()?.let {
-        val (iv, bytes) = it.credential.split('.')
-        val cipher = Cipher.getInstance("AES/GCM/NoPadding")
-        cipher.init(Cipher.DECRYPT_MODE, key(), GCMParameterSpec(128, Wire.decode(iv)))
-        cipher.updateAAD("${it.address}|${it.pin}".encodeToByteArray())
-        SavedConnection(it.address, it.pin, cipher.doFinal(Wire.decode(bytes)).decodeToString())
+    fun saved(identity: DeviceIdentity): SavedConnection? = data.profile()?.let {
+        val bytes = Wire.decode(it.credential)
+        val activation = Activation.read(bytes, identity.decryption, identity.request.serial)
+        SavedConnection(it.address, activation, bytes)
     }
 
-    fun save(connection: SavedConnection) {
-        val cipher = Cipher.getInstance("AES/GCM/NoPadding")
-        cipher.init(Cipher.ENCRYPT_MODE, key())
-        cipher.updateAAD("${connection.address}|${connection.pin}".encodeToByteArray())
-        val encrypted = cipher.doFinal(connection.credential.encodeToByteArray())
-        data.saveProfile(ConnectionProfile(0, connection.address, connection.pin, "${Wire.encode(cipher.iv)}.${Wire.encode(encrypted)}"))
-    }
+    fun save(connection: SavedConnection) =
+        data.saveProfile(ConnectionProfile(0, connection.address, "", Wire.encode(connection.file)))
 
     fun forget() = data.forgetProfile()
     fun record(call: CallHistory) = data.record(call)
-
-    @Synchronized
-    private fun key(): SecretKey {
-        val store = KeyStore.getInstance("AndroidKeyStore").apply { load(null) }
-        val alias = "wi-call-resume-v1"
-        (store.getKey(alias, null) as? SecretKey)?.let { return it }
-        return KeyGenerator.getInstance(KeyProperties.KEY_ALGORITHM_AES, "AndroidKeyStore").apply {
-            init(KeyGenParameterSpec.Builder(alias, KeyProperties.PURPOSE_ENCRYPT or KeyProperties.PURPOSE_DECRYPT)
-                .setBlockModes(KeyProperties.BLOCK_MODE_GCM)
-                .setEncryptionPaddings(KeyProperties.ENCRYPTION_PADDING_NONE)
-                .setKeySize(256)
-                .build())
-        }.generateKey()
-    }
 }
