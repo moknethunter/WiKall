@@ -47,3 +47,39 @@ internal class ServerIdentity(val entry: KeyStore.PrivateKeyEntry) {
         }
     }
 }
+
+internal class DeviceIdentity private constructor(
+    val request: DeviceRequest,
+    val signing: PrivateKey,
+    val decryption: PrivateKey,
+) {
+    companion object {
+        @Synchronized
+        fun load(): DeviceIdentity {
+            val store = KeyStore.getInstance("AndroidKeyStore").apply { load(null) }
+            val signer = entry(store, "wi-call-device-sign-v1", KeyProperties.PURPOSE_SIGN or KeyProperties.PURPOSE_VERIFY) {
+                setSignaturePaddings(KeyProperties.SIGNATURE_PADDING_RSA_PKCS1)
+            }
+            val recipient = entry(store, "wi-call-device-decrypt-v1", KeyProperties.PURPOSE_DECRYPT) {
+                setEncryptionPaddings(KeyProperties.ENCRYPTION_PADDING_RSA_OAEP)
+            }
+            return DeviceIdentity(
+                DeviceRequest(signer.certificate.publicKey, recipient.certificate.publicKey),
+                signer.privateKey, recipient.privateKey,
+            )
+        }
+
+        private fun entry(
+            store: KeyStore, alias: String, purpose: Int, configure: KeyGenParameterSpec.Builder.() -> Unit,
+        ): KeyStore.PrivateKeyEntry {
+            if (!store.containsAlias(alias)) {
+                KeyPairGenerator.getInstance(KeyProperties.KEY_ALGORITHM_RSA, "AndroidKeyStore").apply {
+                    initialize(KeyGenParameterSpec.Builder(alias, purpose)
+                        .setKeySize(2048).setDigests(KeyProperties.DIGEST_SHA256)
+                        .apply(configure).build())
+                }.generateKeyPair()
+            }
+            return store.getEntry(alias, null) as KeyStore.PrivateKeyEntry
+        }
+    }
+}
