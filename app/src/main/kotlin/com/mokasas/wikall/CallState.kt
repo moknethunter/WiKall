@@ -2,7 +2,7 @@ package com.mokasas.wikall
 
 import java.util.UUID
 
-internal enum class CallState { IDLE, CALLING, RINGING, ACCEPTED, CONNECTING, CONNECTED, RECONNECTING, FAILED, REJECTED, MISSED, BUSY, ENDED }
+internal enum class CallState { IDLE, CALLING, RINGING, ACCEPTED, CONNECTING, CONNECTED, RECONNECTING, FAILED, REJECTED, MISSED, BUSY, UNAVAILABLE, ENDED }
 
 internal class LocalCall {
     var id: UUID? = null
@@ -43,6 +43,7 @@ internal class LocalCall {
             SignalType.REJECT -> if (state == CallState.CALLING) complete(CallState.REJECTED)
             SignalType.TIMEOUT -> if (state == CallState.CALLING) complete(CallState.MISSED)
             SignalType.BUSY -> if (state == CallState.CALLING) complete(CallState.BUSY)
+            SignalType.UNAVAILABLE -> if (state == CallState.CALLING) complete(CallState.UNAVAILABLE)
             SignalType.END -> complete(CallState.ENDED)
             else -> Unit
         }

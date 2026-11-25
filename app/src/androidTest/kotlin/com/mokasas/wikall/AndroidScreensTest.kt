@@ -1,5 +1,6 @@
 package com.mokasas.wikall
 
+import android.Manifest
 import android.app.Activity
 import android.app.Instrumentation
 import android.content.Intent
@@ -11,6 +12,8 @@ import androidx.compose.ui.test.onNodeWithText
 import androidx.compose.ui.test.performClick
 import androidx.compose.ui.test.performScrollTo
 import java.io.File
+import java.net.Inet4Address
+import java.net.NetworkInterface
 import androidx.test.ext.junit.runners.AndroidJUnit4
 import org.junit.Rule
 import org.junit.Test
@@ -40,6 +43,31 @@ class AndroidScreensTest {
             DeviceRequest.read(unpackTransfer(Transfer.REQUEST, archive.readBytes()))
         } finally {
             instrumentation.removeMonitor(chooser)
+        }
+    }
+    @Test fun theDialPadSubmitsTheFiveDigitNumber() {
+        val activity = app.activity
+        val instrumentation = InstrumentationRegistry.getInstrumentation()
+        instrumentation.uiAutomation.grantRuntimePermission(activity.packageName, Manifest.permission.RECORD_AUDIO)
+        val address = NetworkInterface.getNetworkInterfaces().toList()
+            .flatMap { it.inetAddresses.toList() }.filterIsInstance<Inet4Address>()
+            .mapNotNull { it.hostAddress }.first(::privateIpv4)
+
+        app.onNodeWithText("إدارة الخادم · 99000").performClick()
+        app.runOnIdle { activity.controller.start(address) }
+        try {
+            app.waitUntil(10_000) {
+                app.onAllNodes(androidx.compose.ui.test.hasText("شاشة الاتصال")).fetchSemanticsNodes().isNotEmpty()
+            }
+            app.onNodeWithText("شاشة الاتصال").performClick()
+            "99001".forEach { digit -> app.onNodeWithText(digit.toString()).performClick() }
+            app.onNodeWithText("99001").assertIsDisplayed()
+            app.onNodeWithText("اتصل").performClick()
+            app.waitUntil(10_000) {
+                app.onAllNodes(androidx.compose.ui.test.hasText("الرقم 99001 غير متصل")).fetchSemanticsNodes().isNotEmpty()
+            }
+        } finally {
+            app.runOnIdle { activity.controller.stop() }
         }
     }
 }
