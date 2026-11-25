@@ -260,12 +260,16 @@ internal class ConnectionController @Inject constructor(
     }
 
     fun dial(peer: String) {
-        if (call.id != null) return
-        if (state.value.mode == Mode.SERVER) {
-            val target = onlineChannels[peer] ?: return
-            selectPeer(peer, target)
-        } else if (channel == null || state.value.peer != peer) return
-        call.dial()?.let(::send)
+        val snapshot = state.value
+        if (call.id != null || !validNumber(peer) || peer == snapshot.number) return
+        if (snapshot.mode == Mode.SERVER) {
+            if (host == null) return
+            selectPeer(peer, onlineChannels[peer])
+        } else {
+            if (snapshot.mode != Mode.CLIENT || channel == null) return
+            selectPeer(peer, channel)
+        }
+        call.dial()?.copy(number = peer)?.let(::send)
         changed()
     }
 
@@ -328,8 +332,8 @@ internal class ConnectionController @Inject constructor(
         }, 5_000L)
     }
 
-    private fun selectPeer(number: String, target: SignalChannel) {
-        if (channel !== target) {
+    private fun selectPeer(number: String, target: SignalChannel?) {
+        if (channel !== target || state.value.peer != number) {
             waiting = null
             channel = target
             publish(state.value.copy(peer = number, latency = null))
@@ -337,13 +341,11 @@ internal class ConnectionController @Inject constructor(
     }
 
     private fun receivedFrom(number: String, message: Signal) {
-        val target = onlineChannels[number] ?: return
-        if (call.id != null && state.value.peer != number) {
-            if (message.type == SignalType.INVITE) sendTo(target, Signal(SignalType.BUSY, message.id))
-            return
+        if (call.id == null && message.type == SignalType.INVITE) {
+            val source = onlineChannels[number] ?: return
+            selectPeer(number, source)
         }
-        if (call.id == null && message.type == SignalType.INVITE) selectPeer(number, target)
-        if (channel === target) received(message)
+        if (state.value.peer == number) received(message)
     }
 
     private fun lanSocketFactory(address: String): javax.net.SocketFactory? {
@@ -366,6 +368,10 @@ internal class ConnectionController @Inject constructor(
     }
 
     private fun received(message: Signal) {
+        if (state.value.mode == Mode.CLIENT && call.id == null && message.type == SignalType.INVITE) {
+            val caller = message.number ?: return
+            selectPeer(caller, channel)
+        }
         when (message.type) {
             SignalType.PING -> send(Signal(SignalType.PONG, message.id))
             SignalType.PONG -> waiting?.takeIf { it.first == message.id }?.let {
@@ -416,6 +422,7 @@ internal class ConnectionController @Inject constructor(
                     when (next) {
                         CallState.RINGING -> decide(SignalType.TIMEOUT)
                         CallState.CALLING -> {
+                            send(Signal(SignalType.END, id))
                             call.remote(Signal(SignalType.TIMEOUT, id))
                             changed()
                         }
@@ -430,8 +437,10 @@ internal class ConnectionController @Inject constructor(
     }
 
     private fun send(message: Signal) {
-        val active = channel ?: return
-        sendTo(active, message)
+        val server = host
+        if (server != null && message.type != SignalType.PING && message.type != SignalType.PONG) {
+            sender.execute { server.sendAsHost(message) }
+        } else channel?.let { sendTo(it, message) }
     }
 
     private fun sendTo(active: SignalChannel, message: Signal) {

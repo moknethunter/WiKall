@@ -139,9 +139,22 @@ class ContractTest {
                 LocalClient("127.0.0.1", Wire.pin(pub), host.localPort).use { secondClient ->
                     firstClient.connect(activation(a), first.private)
                     secondClient.connect(activation(b), second.private)
-                    val call = Signal(SignalType.INVITE, UUID.randomUUID())
+                    val call = Signal(SignalType.INVITE, UUID.randomUUID(), number = HOST_NUMBER)
                     firstClient.send(call)
-                    assertEquals(a.number to call, seen.poll(5, TimeUnit.SECONDS))
+                    assertEquals(a.number to call.copy(number = a.number), seen.poll(5, TimeUnit.SECONDS))
+                    host.sendAsHost(Signal(SignalType.REJECT, call.id))
+                    assertEquals(Signal(SignalType.REJECT, call.id), firstClient.receive())
+
+                    val peerCall = Signal(SignalType.INVITE, UUID.randomUUID(), number = b.number)
+                    firstClient.send(peerCall)
+                    assertEquals(peerCall.copy(number = a.number), secondClient.receive())
+                    secondClient.send(Signal(SignalType.ACCEPT, peerCall.id))
+                    assertEquals(Signal(SignalType.ACCEPT, peerCall.id), firstClient.receive())
+                    val offer = Signal(SignalType.OFFER, peerCall.id, "sample audio offer")
+                    firstClient.send(offer)
+                    assertEquals(offer, secondClient.receive())
+                    secondClient.send(Signal(SignalType.END, peerCall.id))
+                    assertEquals(Signal(SignalType.END, peerCall.id), firstClient.receive())
                     val ping = UUID.randomUUID()
                     secondClient.send(Signal(SignalType.PING, ping))
                     assertEquals(Signal(SignalType.PONG, ping), secondClient.receive())
@@ -155,6 +168,25 @@ class ContractTest {
                 assertThrows(IOException::class.java) { client.connect(activation(a), first.private) }
             }
         }
+    }
+
+    @Test fun routesEachNumberAndRejectsThirdPartyCallSignals() {
+        val routing = NumberRouting()
+        val a = "99001"
+        val b = "99002"
+        val callId = UUID.randomUUID()
+        val call = Signal(SignalType.INVITE, callId, number = b)
+        assertEquals(RoutedSignal(a, b, call.copy(number = a)), routing.receive(a, call) { true })
+        assertNull(routing.receive(HOST_NUMBER, Signal(SignalType.END, callId)) { true })
+        assertNull(routing.receive(a, Signal(SignalType.ACCEPT, callId)) { true })
+        assertNull(routing.receive(a, Signal(SignalType.OFFER, callId, "called too early")) { true })
+        assertEquals(SignalType.BUSY, routing.receive(HOST_NUMBER, call.copy(id = UUID.randomUUID())) { true }?.message?.type)
+        assertEquals(a, routing.receive(b, Signal(SignalType.ACCEPT, callId)) { true }?.to)
+        assertEquals(b, routing.receive(a, Signal(SignalType.OFFER, callId, "audio")) { true }?.to)
+        assertEquals(Signal(SignalType.END, callId), routing.disconnected(b)?.message)
+        assertNull(routing.receive(a, call) { true })
+        val absent = call.copy(id = UUID.randomUUID())
+        assertEquals(SignalType.UNAVAILABLE, routing.receive(a, absent) { false }?.message?.type)
     }
 
     @Test fun mediaRequiresAnAcceptedInvitationAndOnlySupportsLanAudio() {

@@ -22,29 +22,32 @@ import javax.net.ssl.SSLSocket
 import kotlin.concurrent.thread
 
 internal enum class SignalType {
-    CHALLENGE, AUTH, READY, PING, PONG, INVITE, ACCEPT, REJECT, BUSY, TIMEOUT, END, OFFER, ANSWER, ICE
+    CHALLENGE, AUTH, READY, PING, PONG, INVITE, ACCEPT, REJECT, BUSY, UNAVAILABLE, TIMEOUT, END, OFFER, ANSWER, ICE
 }
 
-internal data class Signal(val type: SignalType, val id: UUID, val payload: String? = null)
+internal data class Signal(val type: SignalType, val id: UUID, val payload: String? = null, val number: String? = null)
 internal val probeId: UUID = UUID(0, 0)
 private const val MAX_SIGNAL_SIZE = 16 * 1024
 
 private object SignalCodec {
     fun encode(signal: Signal): String {
         val payload = signal.payload?.let { Wire.encode(it.encodeToByteArray()) }.orEmpty()
-        val text = "3|${signal.type.name}|${signal.id}|$payload"
+        val text = "4|${signal.type.name}|${signal.id}|${signal.number.orEmpty()}|$payload"
         require(text.length <= MAX_SIGNAL_SIZE)
         return text
     }
 
     fun decode(text: String): Signal {
         require(text.length in 1..MAX_SIGNAL_SIZE)
-        val parts = text.split('|', limit = 5)
-        require(parts.size == 4 && parts[0] == "3")
+        val parts = text.split('|', limit = 6)
+        require(parts.size == 5 && parts[0] == "4")
         val type = SignalType.valueOf(parts[1])
         val id = UUID.fromString(parts[2])
         require(id.toString() == parts[2])
-        val payload = parts[3].takeIf { it.isNotEmpty() }
+        val number = parts[3].ifEmpty { null }
+        if (type == SignalType.INVITE) require(number != null && validNumber(number))
+        else require(number == null)
+        val payload = parts[4].takeIf { it.isNotEmpty() }
             ?.let { Wire.decode(it).decodeToString(throwOnInvalidSequence = true) }
         when (type) {
             SignalType.CHALLENGE -> require(id == probeId && payload != null && validNonce(payload))
@@ -52,7 +55,7 @@ private object SignalCodec {
             SignalType.OFFER, SignalType.ANSWER, SignalType.ICE -> require(id != probeId && payload != null)
             else -> require(payload == null)
         }
-        return Signal(type, id, payload)
+        return Signal(type, id, payload, number)
     }
 
 }
@@ -108,6 +111,7 @@ internal class LocalHost(
     private val closed = AtomicBoolean()
     private val serving = AtomicBoolean()
     private val active = mutableMapOf<String, FramedSocket>()
+    private val routes = NumberRouting()
     private val accepted = mutableSetOf<SSLSocket>()
     @Volatile private var callbacks: Callbacks? = null
     private val deadlines = ScheduledThreadPoolExecutor(1) { task ->
@@ -132,11 +136,30 @@ internal class LocalHost(
     val localPort: Int get() = listener.localPort
 
     fun revokeDevice(number: String) {
-        val peer = synchronized(leaseLock) {
+        val (peer, ended) = synchronized(leaseLock) {
             registry.revoke(number)
-            active.remove(number)?.also { callbacks?.onEnded?.invoke(number) }
+            val connected = active.remove(number)
+            if (connected != null) callbacks?.onEnded?.invoke(number)
+            connected to routes.disconnected(number)
         }
+        ended?.let(::dispatch)
         runCatching { peer?.close() }
+    }
+
+    fun sendAsHost(message: Signal) {
+        val routed = synchronized(leaseLock) { routes.receive(HOST_NUMBER, message, ::reachable) }
+        routed?.let(::dispatch)
+    }
+
+    private fun reachable(number: String): Boolean = number == HOST_NUMBER || number in active
+
+    private fun dispatch(delivery: RoutedSignal) {
+        if (delivery.to == HOST_NUMBER) {
+            callbacks?.onSignal?.invoke(delivery.from, delivery.message)
+        } else {
+            val target = synchronized(leaseLock) { active[delivery.to] } ?: return
+            runCatching { target.send(delivery.message) }.onFailure { runCatching(target::close) }
+        }
     }
 
     fun serve(
@@ -193,18 +216,23 @@ internal class LocalHost(
             val challenge = Wire.token()
             channel.send(Signal(SignalType.CHALLENGE, probeId, challenge))
             val hello = channel.receive()
+            var oldSocket: FramedSocket? = null
+            var replacedCall: RoutedSignal? = null
             val user = synchronized(leaseLock) {
                 check(!closed.get())
                 val assigned = authorize(hello, challenge)
                 number = assigned
                 channel.send(Signal(SignalType.READY, probeId))
-                active.put(assigned, channel)?.let { previous ->
-                    runCatching(previous::close)
+                oldSocket = active.put(assigned, channel)
+                if (oldSocket != null) {
+                    replacedCall = routes.disconnected(assigned)
                     handler.onEnded(assigned)
                 }
                 handler.onReady(assigned, channel)
                 assigned
             }
+            oldSocket?.let { runCatching(it::close) }
+            replacedCall?.let(::dispatch)
             deadline.cancel(false)
             attempts.release()
             hasPermit = false
@@ -213,8 +241,13 @@ internal class LocalHost(
                 val message = channel.receive()
                 require(message.type != SignalType.AUTH && message.type != SignalType.CHALLENGE && message.type != SignalType.READY)
                 if (message.type == SignalType.PING) channel.send(Signal(SignalType.PONG, message.id))
-                else synchronized(leaseLock) {
-                    if (active[user] === channel) handler.onSignal(user, message)
+                else if (message.type == SignalType.PONG) {
+                    synchronized(leaseLock) { if (active[user] === channel) handler.onSignal(user, message) }
+                } else {
+                    val routed = synchronized(leaseLock) {
+                        if (active[user] === channel) routes.receive(user, message, ::reachable) else null
+                    }
+                    routed?.let(::dispatch)
                 }
             }
         } catch (failure: Exception) {
@@ -226,14 +259,16 @@ internal class LocalHost(
             deadline?.cancel(false)
             if (hasPermit) attempts.release()
             runCatching(socket::close)
-            synchronized(leaseLock) {
+            val ended = synchronized(leaseLock) {
                 accepted.remove(socket)
                 val user = number
                 if (user != null && owner != null && active[user] === owner) {
                     active.remove(user)
                     handler.onEnded(user)
-                }
+                    routes.disconnected(user)
+                } else null
             }
+            ended?.let(::dispatch)
         }
     }
 
@@ -253,6 +288,7 @@ internal class LocalHost(
         val sockets = synchronized(leaseLock) {
             if (!closed.compareAndSet(false, true)) return
             active.clear()
+            routes.clear()
             accepted.toList()
         }
         runCatching(listener::close)

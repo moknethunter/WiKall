@@ -20,6 +20,8 @@ import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.Image
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.size
+import androidx.compose.foundation.layout.heightIn
+import androidx.compose.foundation.layout.widthIn
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material3.Card
 import androidx.compose.material3.CardDefaults
@@ -108,7 +110,14 @@ class MainActivity : ComponentActivity() {
             writeShareFile(File(filesDir, "exports/activations/Wi-Call-$number.zip"), Transfer.ACTIVATION, bytes)
         }
         request = null
-        "صدر تفعيل المستخدم $number. شاركه مع صاحب الطلب." to file
+        "حُفظ ملف Wi-Call-$number.zip للمستخدم $number." to file
+    }
+
+    private fun shareIssued(number: String) = prepareShare(Transfer.ACTIVATION) {
+        require(number in userNumbers)
+        val file = File(filesDir, "exports/activations/Wi-Call-$number.zip")
+        check(withContext(Dispatchers.IO) { file.isFile })
+        "ملف التفعيل المشفّر للمستخدم $number." to file
     }
 
     private fun writeShareFile(path: File, kind: Transfer, content: ByteArray): File {
@@ -208,6 +217,7 @@ class MainActivity : ComponentActivity() {
         var manualAction by remember { mutableStateOf<((String) -> Unit)?>(null) }
         var addressInput by remember { mutableStateOf("") }
         var revoke by remember { mutableStateOf<String?>(null) }
+        var showDialPad by remember { mutableStateOf(false) }
         BackHandler(mode != Mode.HOME) {
             if (session.mode == Mode.HOME) selectedMode = Mode.HOME else moveTaskToBack(true)
         }
@@ -239,6 +249,7 @@ class MainActivity : ComponentActivity() {
                         if (address != null) {
                             Text("$address:$PORT", style = TextStyle(textDirection = TextDirection.Ltr))
                             Text("المتصلون ${session.onlineUsers.size} · الأرقام المخصصة ${session.devices.size} من $USER_LIMIT")
+                            if (session.callId == null) Action("شاشة الاتصال") { showDialPad = true }
                         } else if (!session.busy) {
                             Action("تشغيل الخادم") {
                                 val addresses = runCatching(controller::listAddresses).getOrDefault(emptyList())
@@ -253,7 +264,7 @@ class MainActivity : ComponentActivity() {
                             }
                         }
                     }
-                    session.peer?.takeIf { session.callId != null }?.let { peer ->
+                    session.peer?.takeIf { session.callState != CallState.IDLE }?.let { peer ->
                         Panel("المكالمة") { CallPane(session, peer) }
                     }
                     if (session.address != null) {
@@ -273,6 +284,7 @@ class MainActivity : ComponentActivity() {
                                     Action("اتصل بـ ${user.number}") { withMicrophone { controller.dial(user.number) } }
                                 }
                                 if (!user.revoked) {
+                                    Action("مشاركة تفعيل ${user.number}", true) { shareIssued(user.number) }
                                     Action("إلغاء تفعيل ${user.number}", true) { revoke = user.number }
                                 }
                                 HorizontalDivider()
@@ -281,9 +293,6 @@ class MainActivity : ComponentActivity() {
                             request?.let { pending ->
                                 Text("معرّف الطلب ${pending.serial.take(12)}", style = TextStyle(textDirection = TextDirection.Content))
                                 Action("إصدار التفعيل ومشاركته") { issueAndShare(pending) }
-                            }
-                            exported?.takeIf { it.kind == Transfer.ACTIVATION }?.let { document ->
-                                Action("مشاركة ملف التفعيل", true) { share(document) }
                             }
                         }
                     }
@@ -312,7 +321,10 @@ class MainActivity : ComponentActivity() {
                         }
                     }
                     if (peer != null) {
-                        Panel("المكالمة") { CallPane(session, peer) }
+                        Panel("المكالمة") {
+                            if (session.callId == null) Action("شاشة الاتصال") { showDialPad = true }
+                            CallPane(session, peer)
+                        }
                     } else if (!session.busy) {
                         Panel("تفعيل هذا الهاتف") {
                             Action("طلب التفعيل", action = ::shareRequest)
@@ -328,6 +340,17 @@ class MainActivity : ComponentActivity() {
             if (session.busy) Action("إلغاء الاتصال", true, ::leave)
             if (note.isNotBlank()) Text(note, color = MaterialTheme.colorScheme.onSurfaceVariant)
             if (mode != Mode.HOME) Action("العودة لاختيار الوضع", true, ::leave)
+        }
+
+        if (showDialPad) {
+            DialPad(
+                ownNumber = session.number,
+                onClose = { showDialPad = false },
+                onCall = { number ->
+                    showDialPad = false
+                    withMicrophone { controller.dial(number) }
+                },
+            )
         }
 
         addressChoices?.let { items ->
@@ -386,7 +409,7 @@ class MainActivity : ComponentActivity() {
 
     @Composable
     private fun CallPane(session: SessionState, peer: String) {
-        Text("المستخدم $peer متصل", style = MaterialTheme.typography.titleMedium)
+        Text("الرقم $peer", style = MaterialTheme.typography.titleMedium)
         val status = when (session.callState) {
             CallState.IDLE -> ""
             CallState.CALLING -> "جارٍ الاتصال بالمستخدم $peer"
@@ -399,6 +422,7 @@ class MainActivity : ComponentActivity() {
             CallState.REJECTED -> "رُفضت المكالمة"
             CallState.MISSED -> "انتهت مهلة الإجابة"
             CallState.BUSY -> "المستخدم مشغول"
+            CallState.UNAVAILABLE -> "الرقم $peer غير متصل"
             CallState.ENDED -> "انتهت المكالمة"
         }
         if (status.isNotEmpty()) Text(status)
@@ -419,9 +443,61 @@ class MainActivity : ComponentActivity() {
                 Action(if (session.muted) "إلغاء كتم الميكروفون" else "كتم الميكروفون", true, controller::toggleMute)
             }
             Action("إنهاء المكالمة", true) { controller.decide(SignalType.END) }
-        } else Action("اتصل بـ $peer") { withMicrophone { controller.dial(peer) } }
-        Action("افحص الاتصال", true, controller::probe)
+        }
+        if (session.mode == Mode.CLIENT || peer in session.onlineUsers) {
+            Action("افحص الاتصال", true, controller::probe)
+        }
         session.latency?.let { Text("زمن الذهاب والإياب $it مللي ثانية") }
+    }
+
+    @Composable
+    private fun DialPad(ownNumber: String?, onClose: () -> Unit, onCall: (String) -> Unit) {
+        var digits by remember { mutableStateOf("") }
+        val available = validNumber(digits) && digits != ownNumber
+        AlertDialog(
+            onDismissRequest = onClose,
+            title = { Text("طلب رقم") },
+            text = {
+                Column(
+                    verticalArrangement = Arrangement.spacedBy(8.dp),
+                    horizontalAlignment = Alignment.CenterHorizontally,
+                    modifier = Modifier.fillMaxWidth(),
+                ) {
+                    Text(
+                        digits.ifEmpty { "أدخل خمسة أرقام" },
+                        style = MaterialTheme.typography.headlineMedium.copy(textDirection = TextDirection.Ltr),
+                    )
+                    CompositionLocalProvider(LocalLayoutDirection provides LayoutDirection.Ltr) {
+                        listOf("123", "456", "789").forEach { row ->
+                            Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                                row.forEach { digit ->
+                                    OutlinedButton(
+                                        onClick = { if (digits.length < 5) digits += digit },
+                                        modifier = Modifier.weight(1f).heightIn(min = 48.dp),
+                                    ) { Text(digit.toString()) }
+                                }
+                            }
+                        }
+                        Row(
+                            horizontalArrangement = Arrangement.spacedBy(8.dp),
+                            modifier = Modifier.widthIn(min = 208.dp),
+                        ) {
+                            OutlinedButton(
+                                onClick = { if (digits.length < 5) digits += '0' },
+                                modifier = Modifier.weight(1f).heightIn(min = 48.dp),
+                            ) { Text("0") }
+                            OutlinedButton(
+                                onClick = { digits = digits.dropLast(1) },
+                                enabled = digits.isNotEmpty(),
+                                modifier = Modifier.weight(2f).heightIn(min = 48.dp),
+                            ) { Text("حذف") }
+                        }
+                    }
+                }
+            },
+            confirmButton = { Button(enabled = available, onClick = { onCall(digits) }) { Text("اتصل") } },
+            dismissButton = { OutlinedButton(onClick = onClose) { Text("إغلاق") } },
+        )
     }
 
     @Composable
