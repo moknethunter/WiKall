@@ -104,6 +104,7 @@ class Directory:
         self.invited = set()
         self.authenticating = Counter()
         self.offline_since = {}
+        self.handoffs = {}
 
     def ice(self, number):
         result = [{"url": self.stun}] if self.stun else []
@@ -144,6 +145,7 @@ class Directory:
 
     async def sweep(self):
         now = int(time.time())
+        self.handoffs = {key: value for key, value in self.handoffs.items() if value[2] > now}
         expired = self.db.execute("SELECT * FROM calls WHERE state='ringing' AND expires<=?", (now,)).fetchall()
         with self.db:
             self.db.execute("UPDATE calls SET state='missed', updated=? WHERE state='ringing' AND expires<=?", (now, now))
@@ -219,6 +221,10 @@ class Directory:
             with self.db:
                 self.db.execute("UPDATE calls SET ack=1 WHERE realm=? AND id=? AND callee=? AND state='missed'", (realm, call_id, number))
             return
+        if kind in ("HANDOFF_REQUEST", "HANDOFF_CONFIRM"):
+            if not row:
+                await self.handoff(realm, number, call_id, kind, message, now)
+            return
         if kind == "INVITE":
             to = message.get("number")
             if not isinstance(to, str) or to not in NUMBERS or to == number:
@@ -266,6 +272,35 @@ class Directory:
         if state != "ringing":
             self.invited.discard((realm, call_id))
         await self.send(realm, to, outgoing)
+
+    async def handoff(self, realm, number, call_id, kind, message, now):
+        peer, role = message.get("number"), message.get("payload")
+        if not isinstance(peer, str) or peer not in NUMBERS or peer == number or role not in ("caller", "callee"):
+            raise ValueError("Invalid handoff")
+        caller, callee = (number, peer) if role == "caller" else (peer, number)
+        key = realm, call_id
+        if self.busy(realm, caller) or self.busy(realm, callee):
+            return
+        pending = self.handoffs.get(key)
+        if pending and pending[2] <= now:
+            self.handoffs.pop(key, None)
+            pending = None
+        if kind == "HANDOFF_REQUEST" and (not pending or pending[0] == number):
+            if len(self.handoffs) >= 256 and not pending:
+                return
+            self.handoffs[key] = (number, peer, now + 15, caller, callee)
+            await self.send(realm, peer, {"type": "HANDOFF_CHECK", "id": call_id, "number": number})
+            return
+        if not pending or pending[:2] != (peer, number) or pending[3:] != (caller, callee):
+            return
+        if any((realm, member) not in self.sessions for member in (caller, callee)):
+            return
+        self.handoffs.pop(key, None)
+        with self.db:
+            self.db.execute("INSERT INTO calls (realm,id,caller,callee,state,expires,updated) VALUES (?,?,?,?,?,?,?)",
+                            (realm, call_id, caller, callee, "accepted", now + TTL, now))
+        await self.send(realm, callee, {"type": "HANDOFF", "id": call_id, "number": caller})
+        await self.send(realm, caller, {"type": "HANDOFF", "id": call_id, "number": callee})
 
     async def socket(self, request):
         if not request.secure and not request.app[ALLOW_INTERNAL_PROXY]:

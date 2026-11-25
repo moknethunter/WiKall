@@ -75,6 +75,7 @@ internal class ConnectionController @Inject constructor(
     private var internetIce: List<InternetIce>? = null
     private var internetCall = false
     private var pendingInternet: Signal? = null
+    private var handoff: Runnable? = null
     private var monitoring = false
     private var topology: Pair<Network?, List<String>>? = null
     private var networkChange: Runnable? = null
@@ -531,6 +532,8 @@ internal class ConnectionController @Inject constructor(
             voice = null
             pendingMedia.clear()
             pendingInternet = null
+            handoff?.let(main::removeCallbacks)
+            handoff = null
             internetCall = false
             val completed = trackedId
             val peer = state.value.peer
@@ -617,6 +620,7 @@ internal class ConnectionController @Inject constructor(
             }
         }
         publish(state.value.copy(peer = state.value.peer.takeIf { internetCall || preserveAccepted && call.accepted }, latency = null, busy = false, status = reason))
+        if (preserveAccepted) scheduleHandoff()
     }
 
     fun stop() {
@@ -632,6 +636,8 @@ internal class ConnectionController @Inject constructor(
         internetIce = null
         internetCall = false
         pendingInternet = null
+        handoff?.let(main::removeCallbacks)
+        handoff = null
         savedClient = null
         retry?.let(main::removeCallbacks)
         retry = null
@@ -709,8 +715,10 @@ internal class ConnectionController @Inject constructor(
                     registerMissedPush(context) { token ->
                         onMain(current) { if (version == directoryVersion) directory?.pushToken(token) }
                     }
-                    if (internetCall && call.accepted) requestRepair()
-                    else pendingInternet?.takeIf { internetCall && it.id == call.id }?.let {
+                    if (call.accepted) {
+                        if (internetCall) requestRepair()
+                        else if (call.state == CallState.RECONNECTING) scheduleHandoff()
+                    } else pendingInternet?.takeIf { internetCall && it.id == call.id }?.let {
                         directory?.send(it)
                         pendingInternet = null
                     }
@@ -723,6 +731,26 @@ internal class ConnectionController @Inject constructor(
             signal = { message ->
                 onMain(current) {
                     if (version != directoryVersion) return@onMain
+                    if (message.type == SignalType.HANDOFF_CHECK) {
+                        if (!internetCall && call.accepted && message.id == call.id && message.number == state.value.peer)
+                            offerHandoff(SignalType.HANDOFF_CONFIRM)
+                        return@onMain
+                    }
+                    if (message.type == SignalType.HANDOFF) {
+                        if (!internetCall && call.accepted && message.id == call.id && message.number == state.value.peer) {
+                            internetCall = true
+                            handoff?.let(main::removeCallbacks)
+                            handoff = null
+                            pendingMedia.clear()
+                            val hadMedia = voice != null
+                            voice?.close()
+                            voice = null
+                            call.media(CallState.ACCEPTED)
+                            changed()
+                            if (hadMedia) startMedia(message.id)
+                        }
+                        return@onMain
+                    }
                     if (message.type == SignalType.INVITE) {
                         if (call.id == message.id) return@onMain
                         if (call.id != null) {
@@ -775,6 +803,9 @@ internal class ConnectionController @Inject constructor(
     private fun showMissed(item: MissedCall) {
         val notifications = context.getSystemService(NotificationManager::class.java)
         if (!notifications.areNotificationsEnabled()) return
+        if (android.os.Build.VERSION.SDK_INT >= 33 &&
+            context.checkSelfPermission(android.Manifest.permission.POST_NOTIFICATIONS) != android.content.pm.PackageManager.PERMISSION_GRANTED
+        ) return
         notifications.createNotificationChannel(NotificationChannel("wi-call-missed", "مكالمات Wi-Call الفائتة", NotificationManager.IMPORTANCE_DEFAULT))
         val action = PendingIntent.getActivity(context, 0, Intent(context, MainActivity::class.java),
             PendingIntent.FLAG_IMMUTABLE or PendingIntent.FLAG_UPDATE_CURRENT)
@@ -842,7 +873,7 @@ internal class ConnectionController @Inject constructor(
                             if (selected != hostAddress || (host == null && selected != null)) {
                                 onlineChannels.clear()
                                 discovery.close()
-                                if (!internetCall) disconnect("تغيّرت الشبكة المحلية.")
+                                if (!internetCall) disconnect("تغيّرت الشبكة المحلية.", preserveAccepted = true)
                                 bind(selected)
                             }
                         }
@@ -851,7 +882,7 @@ internal class ConnectionController @Inject constructor(
                                 discovery.close()
                                 val old = client
                                 client = null
-                                channel = null
+                                disconnect("تغيّرت الشبكة المحلية.", preserveAccepted = true)
                                 locate(it, false)
                                 worker.execute { runCatching { old?.close() } }
                             }
@@ -861,6 +892,22 @@ internal class ConnectionController @Inject constructor(
                 }
             }.also { main.postDelayed(it, 800) }
         }
+    }
+
+    private fun scheduleHandoff() {
+        if (internetCall || !call.accepted || handoff != null) return
+        val id = call.id
+        handoff = Runnable {
+            handoff = null
+            if (id == call.id && call.state == CallState.RECONNECTING) offerHandoff(SignalType.HANDOFF_REQUEST)
+        }.also { main.postDelayed(it, 4_000L) }
+    }
+
+    private fun offerHandoff(type: SignalType) {
+        val id = call.id ?: return
+        val peer = state.value.peer ?: return
+        if (internetCall || !call.accepted || internetIce == null) return
+        directory?.send(Signal(type, id, if (call.outgoing) "caller" else "callee", peer))
     }
 
     private fun requestRepair() {

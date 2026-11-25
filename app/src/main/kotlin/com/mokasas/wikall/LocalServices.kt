@@ -36,7 +36,7 @@ class LocalServerForegroundService : Service() {
     override fun onCreate() {
         super.onCreate()
         notifications.createNotificationChannel(
-            NotificationChannel(NETWORK_CHANNEL, "الاتصال بالشبكة المحلية", NotificationManager.IMPORTANCE_LOW)
+            NotificationChannel(NETWORK_CHANNEL, "خدمة Wi-Call", NotificationManager.IMPORTANCE_LOW)
         )
         notifications.createNotificationChannel(
             NotificationChannel(INCOMING_CHANNEL, "المكالمات الواردة", NotificationManager.IMPORTANCE_HIGH).apply {
@@ -90,9 +90,9 @@ class LocalServerForegroundService : Service() {
     private fun ongoing(state: SessionState): Notification {
         val message = when (state.callState) {
             CallState.ACCEPTED -> "افتح التطبيق لتشغيل الصوت."
-            CallState.CONNECTING, CallState.RECONNECTING -> "جارٍ إعداد المكالمة المحلية."
-            CallState.CONNECTED -> "مكالمة صوتية محلية."
-            else -> state.status.ifBlank { "Wi-Call متاح على الشبكة المحلية." }
+            CallState.CONNECTING, CallState.RECONNECTING -> "جارٍ إعداد المكالمة."
+            CallState.CONNECTED -> "مكالمة صوتية."
+            else -> state.status.ifBlank { "Wi-Call جاهز للاتصال." }
         }
         val stop = PendingIntent.getService(
             this, 11, Intent(this, LocalServerForegroundService::class.java).setAction(ACTION_STOP),
@@ -183,7 +183,7 @@ class CallSessionService : Service() {
         val notification = Notification.Builder(this, "wi-call-audio")
             .setSmallIcon(R.drawable.ic_wikall)
             .setContentTitle("مكالمة Wi-Call")
-            .setContentText("الصوت عبر الشبكة المحلية")
+            .setContentText("الصوت أثناء المكالمة")
             .setContentIntent(openApp(this))
             .setOngoing(true)
             .build()

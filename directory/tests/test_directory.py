@@ -92,6 +92,21 @@ class DirectoryTests(unittest.IsolatedAsyncioTestCase):
         await self.send(member, "END", call_id)
         await self.expect(self.owner, "END", call_id)
 
+    async def test_lan_handoff_needs_both_authenticated_parties(self):
+        member, _ = await self.join("99001", self.member)
+        call_id = str(uuid.uuid4())
+        await self.send(self.owner, "HANDOFF_REQUEST", call_id, number="99001", payload="caller")
+        self.assertEqual((await self.expect(member, "HANDOFF_CHECK", call_id))["number"], "99000")
+        self.assertIsNone(self.directory.row(self.realm, call_id))
+        await self.send(member, "HANDOFF_CONFIRM", call_id, number="99000", payload="caller")
+        await asyncio.sleep(0.02)
+        self.assertIsNone(self.directory.row(self.realm, call_id))
+        await self.send(member, "HANDOFF_CONFIRM", call_id, number="99000", payload="callee")
+        self.assertEqual((await self.expect(member, "HANDOFF", call_id))["number"], "99000")
+        self.assertEqual((await self.expect(self.owner, "HANDOFF", call_id))["number"], "99001")
+        await self.send(self.owner, "OFFER", call_id, payload="handoff audio")
+        self.assertEqual((await self.expect(member, "OFFER", call_id))["payload"], "handoff audio")
+
     async def test_offline_missed_push_and_reconnect_acknowledgement(self):
         member, _ = await self.join("99001", self.member)
         await member.send_json({"type": "PUSH", "token": "test-device-token"})

@@ -1,6 +1,6 @@
 # Wi-Call Internet and site routing
 
-The Android app prefers the pinned local server. On an unavailable local route, it uses the configured HTTPS directory. The deployment uses a single directory process with a persistent SQLite database.
+The Android app prefers the pinned local server. On an unavailable local route, it uses the configured HTTPS directory. An accepted local call can also move to Internet signaling if the local path fails and both authenticated phones confirm the same active call. The deployment uses a single directory process with a persistent SQLite database.
 
 ## Directory and TURN
 
@@ -19,4 +19,4 @@ A WireGuard tunnel needs a reachable path between the gateways. Without an Inter
 
 ## Release acceptance
 
-Run the CI Python and Android tests. Before a release, test upgrades in place from the deployed signing identity and keep the original activation files and Android Keystore. Confirm two physical Android phones can both hear audio on router Wi-Fi without Internet and on a hotspot hosted by each phone in turn. Confirm local preference when Internet is available, Wi-Fi to mobile data, two different Wi-Fi networks, forced TURN, switching Internet access during a call, missed delivery after reconnect with and without FCM, and rejection of copied or revoked activation. For sites using WireGuard, validate with two routed gateways. Record actual device, Android version, and network type for each test.
+Run the CI Python and Android tests. Before a release, test upgrades in place from the deployed signing identity and keep the original activation files and Android Keystore. Confirm two physical Android phones can both hear audio on router Wi-Fi without Internet and on a hotspot hosted by each phone in turn. Confirm local preference when Internet is available, Wi-Fi to mobile data, two different Wi-Fi networks, forced TURN, switching Internet access during a call, moving an active call from LAN to the Internet, missed delivery after reconnect with and without FCM, and rejection of copied or revoked activation. For sites using WireGuard, validate with two routed gateways. Record actual device, Android version, and network type for each test.
