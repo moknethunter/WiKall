@@ -30,6 +30,7 @@ internal data class DeviceRequest(val signing: PublicKey, val encryption: Public
     fun export(key: PrivateKey): ByteArray {
         val body = buildJsonObject {
             put("type", "wi-call-request-1")
+            put("serial", serial)
             put("signing", Wire.encode(signing.encoded))
             put("encryption", Wire.encode(encryption.encoded))
         }.bytes()
@@ -44,6 +45,7 @@ internal data class DeviceRequest(val signing: PublicKey, val encryption: Public
             require(request.value("type") == "wi-call-request-1")
             val key = publicKey(request.value("signing"))
             require(Wire.verified(key, body, Wire.decode(envelope.value("signature"))))
+            require(request.value("serial") == Wire.pin(key))
             return DeviceRequest(key, publicKey(request.value("encryption")))
         }
     }
