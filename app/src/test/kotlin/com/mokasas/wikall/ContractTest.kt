@@ -41,8 +41,11 @@ class ContractTest {
         assertThrows(IllegalArgumentException::class.java) {
             Activation.read(bytes, second.private, Wire.pin(second.public))
         }
+        val wrongHost = KeyPairGenerator.getInstance("EC").apply {
+            initialize(java.security.spec.ECGenParameterSpec("secp256r1"))
+        }.generateKeyPair().private
         assertThrows(IllegalArgumentException::class.java) {
-            Activation.read(issued.export(first.private, submitted.encryption), second.private, device.serial)
+            Activation.read(issued.export(wrongHost, submitted.encryption), second.private, device.serial)
         }
         val challenge = Wire.token()
         val response = Wire.signature(first.private, issued.proof(challenge))
@@ -180,7 +183,7 @@ class ContractTest {
             val keytool = File(System.getProperty("java.home"), "bin/keytool")
             val process = ProcessBuilder(
                 keytool.path, "-genkeypair", "-noprompt", "-alias", "fixture", "-dname", "CN=Wi-Call Test",
-                "-keyalg", "RSA", "-keysize", "2048", "-validity", "2", "-storetype", "PKCS12",
+                "-keyalg", "EC", "-groupname", "secp256r1", "-validity", "2", "-storetype", "PKCS12",
                 "-keystore", fixture.path, "-storepass", "fixture-only",
             ).redirectErrorStream(true).start()
             val output = process.inputStream.bufferedReader().use { it.readText() }

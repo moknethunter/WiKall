@@ -219,6 +219,9 @@ internal class LocalHost(
             }
         } catch (failure: Exception) {
             if (!handshaken) onHandshakeFailure?.invoke(failure)
+        } catch (failure: Error) {
+            if (!handshaken) onHandshakeFailure?.invoke(failure)
+            throw failure
         } finally {
             deadline?.cancel(false)
             if (hasPermit) attempts.release()

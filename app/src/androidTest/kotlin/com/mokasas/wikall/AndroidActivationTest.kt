@@ -42,14 +42,19 @@ class AndroidActivationTest {
         assertTrue(runCatching { Activation.read(bytes, otherKey.private, request.serial) }.isFailure)
 
         val handshakeFailure = AtomicReference<Throwable>()
-        LocalHost(server.tls(), lan, 0, store, issued.pin) { handshakeFailure.compareAndSet(null, it) }.use { host ->
+        val reported = CountDownLatch(1)
+        LocalHost(server.tls(), lan, 0, store, issued.pin, onHandshakeFailure = { error ->
+            handshakeFailure.compareAndSet(null, error)
+            reported.countDown()
+        }).use { host ->
             host.serve({ _, _ -> }, { _, _ -> }, {})
             LocalClient(lan, unlocked.pin, host.localPort).use { client ->
                 try {
                     client.connect(unlocked, device.signing)
                 } catch (error: java.io.IOException) {
-                    handshakeFailure.get()?.let(error::addSuppressed)
-                    throw error
+                    reported.await(2, TimeUnit.SECONDS)
+                    val serverError = handshakeFailure.get()?.stackTraceToString().orEmpty()
+                    throw AssertionError("Android TLS server outcome:\n$serverError", error)
                 }
                 val id = UUID.randomUUID()
                 client.send(Signal(SignalType.PING, id))

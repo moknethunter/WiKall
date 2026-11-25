@@ -85,6 +85,7 @@ internal data class Activation(
             put("type", "wi-call-activation-1")
             put("address", address)
             put("server", Wire.encode(server.encoded))
+            put("serverAlgorithm", server.algorithm)
             put("number", number)
             put("serial", serial)
             put("id", id)
@@ -112,7 +113,12 @@ internal data class Activation(
             val envelope = json(cipher.doFinal(Wire.decode(encrypted.value("data"))))
             val body = Wire.decode(envelope.value("body"))
             val decoded = json(body)
-            val server = publicKey(decoded.value("server"))
+            val server = when (decoded.value("serverAlgorithm")) {
+                "EC" -> KeyFactory.getInstance("EC").generatePublic(X509EncodedKeySpec(Wire.decode(decoded.value("server"))))
+                "RSA" -> publicKey(decoded.value("server"))
+                else -> error("Unsupported server identity")
+            }
+            if (server is java.security.interfaces.ECPublicKey) require(server.params.curve.field.fieldSize == 256)
             require(Wire.verified(server, body, Wire.decode(envelope.value("signature"))))
             require(decoded.value("type") == "wi-call-activation-1")
             val address = decoded.value("address")
