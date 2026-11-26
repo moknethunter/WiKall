@@ -43,13 +43,15 @@ internal class NumberRouting {
                 finish(message.id)
             }
             SignalType.END -> finish(message.id)
-            SignalType.OFFER -> if (!route.accepted || from != route.caller) return null
-            SignalType.ANSWER -> if (!route.accepted || from != route.callee) return null
+            SignalType.OFFER, SignalType.RESTART -> if (!route.accepted || from != route.caller) return null
+            SignalType.ANSWER, SignalType.REPAIR -> if (!route.accepted || from != route.callee) return null
             SignalType.ICE -> if (!route.accepted) return null
             else -> return null
         }
         return RoutedSignal(from, to, message)
     }
+
+    fun hasAcceptedCall(number: String): Boolean = calls.values.any { it.accepted && it.other(number) != null }
 
     fun disconnected(number: String): RoutedSignal? {
         val call = calls.entries.firstOrNull { it.value.other(number) != null } ?: return null

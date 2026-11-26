@@ -22,7 +22,8 @@ import javax.net.ssl.SSLSocket
 import kotlin.concurrent.thread
 
 internal enum class SignalType {
-    CHALLENGE, AUTH, READY, PING, PONG, INVITE, ACCEPT, REJECT, BUSY, UNAVAILABLE, TIMEOUT, END, OFFER, ANSWER, ICE
+    CHALLENGE, AUTH, READY, PING, PONG, INVITE, ACCEPT, REJECT, BUSY, UNAVAILABLE, TIMEOUT, END, OFFER, ANSWER, ICE, RESTART, REPAIR,
+    HANDOFF_REQUEST, HANDOFF_CHECK, HANDOFF_CONFIRM, HANDOFF
 }
 
 internal data class Signal(val type: SignalType, val id: UUID, val payload: String? = null, val number: String? = null)
@@ -112,6 +113,7 @@ internal class LocalHost(
     private val serving = AtomicBoolean()
     private val active = mutableMapOf<String, FramedSocket>()
     private val routes = NumberRouting()
+    private val departures = mutableMapOf<String, java.util.concurrent.ScheduledFuture<*>>()
     private val accepted = mutableSetOf<SSLSocket>()
     @Volatile private var callbacks: Callbacks? = null
     private val deadlines = ScheduledThreadPoolExecutor(1) { task ->
@@ -138,6 +140,7 @@ internal class LocalHost(
     fun revokeDevice(number: String) {
         val (peer, ended) = synchronized(leaseLock) {
             registry.revoke(number)
+            departures.remove(number)?.cancel(false)
             val connected = active.remove(number)
             if (connected != null) callbacks?.onEnded?.invoke(number)
             connected to routes.disconnected(number)
@@ -224,10 +227,9 @@ internal class LocalHost(
                 number = assigned
                 channel.send(Signal(SignalType.READY, probeId))
                 oldSocket = active.put(assigned, channel)
-                if (oldSocket != null) {
+                departures.remove(assigned)?.cancel(false)
+                if (oldSocket != null && !routes.hasAcceptedCall(assigned))
                     replacedCall = routes.disconnected(assigned)
-                    handler.onEnded(assigned)
-                }
                 handler.onReady(assigned, channel)
                 assigned
             }
@@ -265,7 +267,17 @@ internal class LocalHost(
                 if (user != null && owner != null && active[user] === owner) {
                     active.remove(user)
                     handler.onEnded(user)
-                    routes.disconnected(user)
+                    if (closed.get() || !routes.hasAcceptedCall(user)) routes.disconnected(user)
+                    else {
+                        departures[user] = deadlines.schedule({
+                            val delivery = synchronized(leaseLock) {
+                                departures.remove(user)
+                                if (user !in active) routes.disconnected(user) else null
+                            }
+                            delivery?.let(::dispatch)
+                        }, 16, TimeUnit.SECONDS)
+                        null
+                    }
                 } else null
             }
             ended?.let(::dispatch)
@@ -289,6 +301,8 @@ internal class LocalHost(
             if (!closed.compareAndSet(false, true)) return
             active.clear()
             routes.clear()
+            departures.values.forEach { it.cancel(false) }
+            departures.clear()
             accepted.toList()
         }
         runCatching(listener::close)
@@ -297,6 +311,8 @@ internal class LocalHost(
         deadlines.shutdownNow()
     }
 }
+
+internal class EndpointUnavailable(message: String, cause: Throwable) : IOException(message, cause)
 
 internal class LocalClient(
     private val host: String,
@@ -339,7 +355,8 @@ internal class LocalClient(
                 error is SSLException -> "تعذّر التحقق من هوية الخادم. استخدم ملف تفعيل صادرًا من هذا الخادم."
                 else -> "تعذّر الوصول إلى $host. تحقق من تشغيل الخادم وإمكانية الوصول بين الهاتفين."
             }
-            throw IOException(status, error)
+            if (handshaken) throw IOException(status, error)
+            throw EndpointUnavailable(status, error)
         }
     }
 

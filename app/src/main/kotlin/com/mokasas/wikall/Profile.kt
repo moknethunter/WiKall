@@ -45,3 +45,9 @@ internal fun privateIpv4(address: String): Boolean {
     return first == 10 || first == 172 && second in 16..31 ||
         first == 192 && second == 168 || first == 169 && second == 254
 }
+
+// The activation's address is a hint. Every candidate still uses the pinned server key.
+internal fun lanCandidates(discovered: String?, gateways: List<String>, previous: String, issued: String): List<String> =
+    (listOfNotNull(discovered) + gateways + listOf(previous, issued))
+        .filter(::privateIpv4)
+        .distinct()

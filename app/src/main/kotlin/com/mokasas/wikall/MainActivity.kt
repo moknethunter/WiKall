@@ -219,6 +219,8 @@ class MainActivity : ComponentActivity() {
         var addressInput by remember { mutableStateOf("") }
         var revoke by remember { mutableStateOf<String?>(null) }
         var showDialPad by remember { mutableStateOf(false) }
+        var editDirectory by remember { mutableStateOf(false) }
+        var directoryInput by remember { mutableStateOf("") }
         BackHandler(mode != Mode.HOME) {
             if (session.mode == Mode.HOME) selectedMode = Mode.HOME else moveTaskToBack(true)
         }
@@ -233,7 +235,8 @@ class MainActivity : ComponentActivity() {
                 Image(painterResource(R.drawable.ic_wikall), contentDescription = null, modifier = Modifier.size(52.dp))
                 Column {
                     Text(getString(R.string.app_name), style = MaterialTheme.typography.headlineMedium)
-                    Text("مكالمات محلية", color = MaterialTheme.colorScheme.onSurfaceVariant)
+                    Text(if (session.internetReady) "الاتصال عبر الإنترنت جاهز" else "مكالمات Wi-Call",
+                        color = MaterialTheme.colorScheme.onSurfaceVariant)
                 }
             }
             when (mode) {
@@ -250,14 +253,19 @@ class MainActivity : ComponentActivity() {
                         if (address != null) {
                             Text("$address:$PORT", style = TextStyle(textDirection = TextDirection.Ltr))
                             Text("المتصلون ${session.onlineUsers.size} · الأرقام المخصصة ${session.devices.size} من $USER_LIMIT")
-                            if (session.callId == null) Action("شاشة الاتصال") { showDialPad = true }
-                        } else if (!session.busy) {
+                        }
+                        if ((address != null || session.internetReady) && session.callId == null)
+                            Action("شاشة الاتصال") { showDialPad = true }
+                        if (address == null && !session.busy && session.number == null) {
                             Action("تشغيل الخادم") {
                                 val addresses = runCatching(controller::listAddresses).getOrDefault(emptyList())
                                 when (addresses.size) {
                                     0 -> {
-                                        addressInput = ""
-                                        manualAction = { runSession { controller.start(it) } }
+                                        if (controller.internetEndpoint().isNotBlank()) runSession { controller.start(null) }
+                                        else {
+                                            addressInput = ""
+                                            manualAction = { runSession { controller.start(it) } }
+                                        }
                                     }
                                     1 -> runSession { controller.start(addresses.single()) }
                                     else -> addressChoices = addresses
@@ -265,10 +273,16 @@ class MainActivity : ComponentActivity() {
                             }
                         }
                     }
+                    session.publicKey?.let { key ->
+                        Action("نسخ المفتاح العام لإعداد خدمة الإنترنت", true) {
+                            getSystemService(android.content.ClipboardManager::class.java)
+                                .setPrimaryClip(android.content.ClipData.newPlainText("Wi-Call public key", key))
+                        }
+                    }
                     session.peer?.takeIf { session.callState != CallState.IDLE }?.let { peer ->
                         Panel("المكالمة") { CallPane(session, peer) }
                     }
-                    if (session.address != null) {
+                    if (session.number != null) {
                         Panel("الأجهزة") {
                             if (session.devices.isEmpty()) Text("استورد طلب الجهاز الذي تريد إضافته.")
                             session.devices.forEach { user ->
@@ -281,7 +295,7 @@ class MainActivity : ComponentActivity() {
                                     },
                                     style = MaterialTheme.typography.titleMedium,
                                 )
-                                if (connected && session.callId == null) {
+                                if (!user.revoked && (connected || session.internetReady) && session.callId == null) {
                                     Action("اتصل بـ ${user.number}") { withMicrophone { controller.dial(user.number) } }
                                 }
                                 if (!user.revoked) {
@@ -293,7 +307,7 @@ class MainActivity : ComponentActivity() {
                             Action("استيراد طلب التفعيل", true) { openRequest.launch(arrayOf("*/*")) }
                             request?.let { pending ->
                                 Text("معرّف الطلب ${pending.serial.take(12)}", style = TextStyle(textDirection = TextDirection.Content))
-                                Action("إصدار التفعيل ومشاركته") { issueAndShare(pending) }
+                                if (session.address != null) Action("إصدار التفعيل ومشاركته") { issueAndShare(pending) }
                             }
                         }
                     }
@@ -309,7 +323,7 @@ class MainActivity : ComponentActivity() {
                                     runSession { controller.connect(current.license, current.bytes) }
                                 }
                             } ?: Action("الاتصال بالتفعيل المحفوظ") { runSession { controller.reconnect() } }
-                            Action("عنوان IP يدوي", true) {
+                            Action("تغيير عنوان الخادم", true) {
                                 addressInput = imported?.license?.address ?: session.address.orEmpty()
                                 manualAction = { address ->
                                     val file = imported
@@ -321,10 +335,10 @@ class MainActivity : ComponentActivity() {
                             }
                         }
                     }
-                    if (peer != null) {
+                    if (peer != null || session.internetReady && !session.busy) {
                         Panel("المكالمة") {
                             if (session.callId == null) Action("شاشة الاتصال") { showDialPad = true }
-                            CallPane(session, peer)
+                            if (peer != null) CallPane(session, peer)
                         }
                     } else if (!session.busy) {
                         Panel("تفعيل هذا الهاتف") {
@@ -338,10 +352,37 @@ class MainActivity : ComponentActivity() {
                     }
                 }
             }
+            if (session.missed.isNotEmpty()) Panel("المكالمات الفائتة") {
+                session.missed.forEach { item ->
+                    val time = android.text.format.DateUtils.getRelativeTimeSpanString(item.endedAt)
+                    Text("${item.peer} · $time")
+                    if (session.callId == null && (session.internetReady || session.address != null && session.peer != null)) {
+                        Action("اتصل بـ ${item.peer}", true) { withMicrophone { controller.dial(item.peer) } }
+                    }
+                }
+            }
+            if (session.callId == null) Action("إعداد الاتصال عبر الإنترنت", true) {
+                directoryInput = controller.internetEndpoint()
+                editDirectory = true
+            }
             if (session.busy) Action("إلغاء الاتصال", true, ::leave)
             if (note.isNotBlank()) Text(note, color = MaterialTheme.colorScheme.onSurfaceVariant)
             if (mode != Mode.HOME) Action("العودة لاختيار الوضع", true, ::leave)
         }
+
+        if (editDirectory) AlertDialog(
+            onDismissRequest = { editDirectory = false },
+            title = { Text("خدمة الاتصال عبر الإنترنت") },
+            text = { OutlinedTextField(directoryInput, { directoryInput = it },
+                label = { Text("رابط HTTPS للخدمة") }, singleLine = true) },
+            confirmButton = {
+                Button(enabled = directoryInput.isBlank() || directoryUrl(directoryInput) != null, onClick = {
+                    controller.configureInternet(directoryInput)
+                    editDirectory = false
+                }) { Text("حفظ") }
+            },
+            dismissButton = { Action("إلغاء", true) { editDirectory = false } },
+        )
 
         if (showDialPad) {
             DialPad(
@@ -441,6 +482,7 @@ class MainActivity : ComponentActivity() {
                 Action("تشغيل الصوت") { withMicrophone { startAudio(id) } }
             }
             if (session.callState == CallState.CONNECTED) {
+                Action(if (session.speaker) "مسار الصوت التلقائي" else "مكبر الصوت", true, controller::toggleSpeaker)
                 Action(if (session.muted) "إلغاء كتم الميكروفون" else "كتم الميكروفون", true, controller::toggleMute)
             }
             Action("إنهاء المكالمة", true) { controller.decide(SignalType.END) }
@@ -448,6 +490,8 @@ class MainActivity : ComponentActivity() {
         if (session.mode == Mode.CLIENT || peer in session.onlineUsers) {
             Action("افحص الاتصال", true, controller::probe)
         }
+        if (session.ice.isNotBlank() && session.callState in setOf(CallState.CONNECTING, CallState.RECONNECTING, CallState.FAILED))
+            Text("مسار الصوت · ${session.ice}")
         session.latency?.let { Text("زمن الذهاب والإياب $it مللي ثانية") }
     }
 
@@ -552,6 +596,7 @@ class MainActivity : ComponentActivity() {
 
     @Suppress("DEPRECATION")
     private fun handleIntent(intent: Intent) {
+        if (intent.getStringExtra("wi_missed") == "1") runSession(controller::resumeMissed)
         val uri = when (intent.action) {
             Intent.ACTION_VIEW -> intent.data
             Intent.ACTION_SEND -> if (Build.VERSION.SDK_INT >= 33) intent.getParcelableExtra(Intent.EXTRA_STREAM, Uri::class.java)

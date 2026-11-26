@@ -33,7 +33,8 @@ class AndroidActivationTest {
             .mapNotNull { it.hostAddress }.firstOrNull(::privateIpv4)
         assertNotNull("The emulator must expose a private IPv4 address", address)
         val lan = checkNotNull(address)
-        val issued = Activation(lan, hostKey, assigned.number, assigned.serial, assigned.activationId)
+        val oldAddress = if (lan == "192.168.10.1") "192.168.11.1" else "192.168.10.1"
+        val issued = Activation(oldAddress, hostKey, assigned.number, assigned.serial, assigned.activationId)
         val bytes = issued.export(server.entry.privateKey, request.encryption)
         val unlocked = Activation.read(bytes, DeviceIdentity.load().decryption, request.serial)
         assertEquals(issued.number, unlocked.number)
@@ -62,7 +63,10 @@ class AndroidActivationTest {
             }
         }
         store.save(SavedConnection(lan, unlocked, bytes))
-        assertEquals(unlocked.number, store.saved(DeviceIdentity.load())?.activation?.number)
+        val saved = checkNotNull(store.saved(DeviceIdentity.load()))
+        assertEquals(unlocked.number, saved.activation.number)
+        assertEquals(lan, saved.address)
+        assertEquals(oldAddress, saved.activation.address)
     }
     @Test fun androidWebRtcNegotiatesAnAudioSessionOnLocalUdp() {
         val instrumentation = InstrumentationRegistry.getInstrumentation()
